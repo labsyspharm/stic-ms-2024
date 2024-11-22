@@ -1,0 +1,742 @@
+---
+title: "Tumor progression models plots"
+author: "Clemens Hug"
+date: "2023-10-16"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(qs)
+library(synExtra)
+library(data.table)
+library(powerjoin)
+library(ggdist)
+
+theme_set(theme_minimal(base_family = "Helvetica"))
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+syn_inputs <- c(
+  gene_sets = "syn52658610",
+  meta = "syn52658612",
+  count_matrices = "syn52658861",
+  progression_model_post_draws = "syn53169790",
+  progression_model_global_sexit = "syn53169789",
+  progression_model_warnings = "syn53216398",
+  gene_sets_unique = "syn52658611"
+)
+
+syn_files <- syn_inputs %>%
+  map(syn)
+
+gene_sets <- read_csv(syn_files[["gene_sets"]])
+
+gene_sets_unique <- qread(syn_files[["gene_sets_unique"]])
+
+meta <- read_csv(syn_files[["meta"]])
+
+progression_model_post_draws <- qread(syn_files[["progression_model_post_draws"]])
+progression_model_global_sexit <- qread(syn_files[["progression_model_global_sexit"]])
+progression_model_warnings <- read_csv(syn_files[["progression_model_warnings"]])
+```
+
+## Progression model
+
+```{r}
+lesion_acronyms <- c(
+  "FT" = "FT",
+  "Fimbriae" = "Fim",
+  "p53 signature" = "p53",
+  "STIL" = "STIL",
+  "STIC" = "STIC",
+  "Inv Cancer" = "Tumor"
+)
+
+meta_processed <- meta %>%
+  mutate(
+    lesion_acronym = str_replace_all(
+      Lesions_categories_All, coll(lesion_acronyms)
+    )
+  )
+
+incidental_progression <- c(
+  "FT",
+  "Fimbriae",
+  "p53 signature",
+  "STIC"
+)
+
+cancer_progression <- c(
+  "FT",
+  "Fimbriae",
+  "p53 signature",
+  "STIC",
+  "Inv Cancer"
+)
+```
+
+## Global plots
+
+```{r}
+make_global_trend_plot <- function(data_trend, data_sexit, predictor_var, progression_levels, warnings) {
+  # browser()
+  predictor_var_sym <- rlang::sym(predictor_var)
+  # progression_levels <- levels(data[[predictor_var]])
+  progression_in_common <- intersect(progression_levels, levels(data_trend[[predictor_var]]))
+  lesion_acronyms_in_common <- lesion_acronyms[progression_in_common] %>%
+    set_names(progression_in_common)
+#   browser()
+  data_trend %>%
+    ungroup() %>%
+    mutate(
+        {{predictor_var_sym}} := as.character({{predictor_var_sym}})
+    ) %>%
+    left_join(
+      data_sexit %>%
+        ungroup() %>%
+        separate(contrast, c("contrast_target", "contrast_ref"), sep = " - ") %>%
+        filter(contrast_ref == progression_in_common[1]),
+        # mutate(
+        #   across(starts_with("contrast"), ~str_replace_all(.x, r"{\(|\)}", "")),
+        #   across(starts_with("contrast"), ~ordered(.x, levels = progression_levels))
+        # ),
+      by = join_by({{predictor_var_sym}} == "contrast_target", "gene_set")
+    ) %>%
+    mutate(
+        {{predictor_var_sym}} := ordered(lesion_acronyms_in_common[{{predictor_var_sym}}], levels = lesion_acronyms_in_common)
+    ) %>%
+    ggplot(
+      aes(x = {{predictor_var_sym}}, y = .epred, fill = significant)
+    ) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_text(
+        data = warnings,
+        aes(label = paste("n_divergent:", n_divergent)),
+        hjust = 0, vjust = 1, size = 3, x = -Inf, y = Inf,
+        inherit.aes = FALSE
+      ) +
+      geom_violin() +
+      facet_wrap(~gene_set, scales = "free_y", ncol = 1) +
+      scale_fill_viridis_d(
+        na.value = "grey",
+        labels = \(breaks) {breaks[is.na(breaks)] <- "reference"; breaks}
+      ) +
+      labs(
+        x = "Lesion type",
+        y = "Normalized expression",
+        fill = "Significance\nlevel"
+      )
+}
+
+progression_models_plot_data <- progression_model_post_draws %>%
+  inner_join(
+    progression_model_global_sexit
+  ) %>%
+  inner_join(
+    gene_sets %>%
+      distinct(gene_set_group, gene_set)
+  ) %>%
+  group_by(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term,
+    model_formula, gene_set_group
+  ) %>%
+  summarize(
+    across(
+      where(is.list),
+      \(x) list(bind_rows(set_names(x, gene_set), .id = "gene_set"))
+    ),
+    .groups = "drop"
+  ) %>%
+  inner_join(
+    progression_model_warnings %>%
+      select(
+        gene_set, warning_message = warnings,
+        n_divergent, Cell_Types, sample_type, model_type,
+        predictor_var, predictor_term
+      ) %>%
+      inner_join(
+        gene_sets %>%
+          distinct(gene_set_group, gene_set)
+      ) %>%
+      group_nest(
+        gene_set_group, Cell_Types, sample_type, model_type,
+        predictor_var, predictor_term,
+        .key = "warnings"
+      )
+  )
+
+progression_models_global_progression_plots <- progression_models_plot_data %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      make_global_trend_plot(
+        global_trend, sexit_global, predictor_var,
+        if (gene_set_group == "Incidental") incidental_progression else cancer_progression,
+        warnings
+      )
+    )
+  ) %>%
+  ungroup()
+
+dir.create("plots/progression_models_post_draws/all_progression", recursive = TRUE, showWarnings = FALSE)
+pwalk(
+  progression_models_global_progression_plots,
+  function(Cell_Types, sample_type, gene_set_group, p, global_trend, ...) {
+    n_rows <- global_trend %>%
+      ungroup() %>%
+      distinct(gene_set) %>%
+      nrow()
+    n_cols <- global_trend %>%
+      ungroup() %>%
+      distinct(lesions_categories_all) %>%
+      nrow()
+    message(paste("Saving", gene_set_group, "with", n_rows, "rows", "and", n_cols, "columns", "..."))
+    ggsave(
+      file.path("plots/progression_models_post_draws/all_progression", paste0(Cell_Types, "_", sample_type, "_", gene_set_group, ".pdf")),
+      p,
+      width = 2 + n_cols * 1, height = 1.5 + n_rows * 1,
+      # For unicode compatibility
+      device = Cairo::CairoPDF
+    )
+  }
+)
+
+```
+
+### By gene
+
+```{r}
+make_trend_by_gene_plot <- function(data_trend, data_sexit, predictor_var, progression_levels) {
+  # browser()
+  predictor_var_sym <- rlang::sym(predictor_var)
+  progression_in_common <- intersect(progression_levels, levels(data_trend[[predictor_var]]))
+  lesion_acronyms_in_common <- lesion_acronyms[progression_in_common] %>%
+    set_names(progression_in_common)
+  data_trend %>%
+    mutate(
+        {{predictor_var_sym}} := as.character({{predictor_var_sym}})
+    ) %>%
+    left_join(
+      data_sexit %>%
+        separate(contrast, c("contrast_target", "contrast_ref"), sep = " - ") %>%
+        filter(contrast_ref == progression_in_common[1]),
+        # mutate(
+        #   across(starts_with("contrast"), ~str_replace_all(.x, r"{\(|\)}", "")),
+        #   across(starts_with("contrast"), ~ordered(.x, levels = progression_levels))
+        # ),
+      by = join_by({{predictor_var_sym}} == "contrast_target", "gene_set", "target_name")
+    ) %>%
+    mutate(
+        {{predictor_var_sym}} := ordered(lesion_acronyms_in_common[{{predictor_var_sym}}], levels = lesion_acronyms_in_common)
+    ) %>%
+    ggplot(
+      aes(x = {{predictor_var_sym}}, y = .epred, fill = significant)
+    ) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_violin() +
+      # facet_wrap(~gene_set, scales = "free_y", ncol = 1) +
+      ggh4x::facet_nested_wrap(
+        vars(gene_set, target_name),
+        scales = "free_y",
+      ) +
+      scale_fill_viridis_d(
+        na.value = "grey",
+        labels = \(breaks) {breaks[is.na(breaks)] <- "reference"; breaks}
+      ) +
+      theme_light(base_family = "Helvetica") +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()
+      ) +
+      labs(
+        x = "Lesion type",
+        y = "Normalized expression",
+        fill = "Significance\nlevel"
+      )
+}
+
+progression_models_by_gene_progression_plots <- progression_models_plot_data %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      make_trend_by_gene_plot(
+        trend_by_gene, sexit_by_gene, predictor_var, incidental_progression
+      )
+    )
+  ) %>%
+  ungroup()
+
+pwalk(
+  progression_models_by_gene_progression_plots,
+  function(Cell_Types, sample_type, gene_set_group, p, trend_by_gene, ...) {
+    n_panels <- trend_by_gene %>%
+      ungroup() %>%
+      distinct(target_name, gene_set) %>%
+      nrow()
+    scaling_factor <- sqrt(n_panels) * 1.7
+    message(paste("Saving", gene_set_group, "with", n_panels, "panels", "and scaling factor", scaling_factor, "..."))
+    ggsave(
+      file.path("plots/progression_models_post_draws/all_progression", paste0(Cell_Types, "_", sample_type, "_", gene_set_group, "_by_gene.pdf")),
+      p,
+      width = scaling_factor + 1, height = scaling_factor + 2,
+      # For unicode compatibility
+      device = Cairo::CairoPDF
+    )
+  }
+)
+
+```
+
+
+#### Shaded line colored
+
+Plotting each gene as a shaded line
+
+```{r}
+progression_models_plot_data_by_gene_set <- progression_model_post_draws %>%
+  inner_join(
+    progression_model_global_sexit
+  ) %>%
+  inner_join(
+    gene_sets %>%
+      distinct(gene_set_group, gene_set)
+  )
+
+make_trend_by_gene_plot <- function(data_trend, data_sexit, predictor_var, progression_levels) {
+  # browser()
+  predictor_var_sym <- rlang::sym(predictor_var)
+  progression_in_common <- intersect(progression_levels, levels(data_trend[[predictor_var]]))
+  lesion_acronyms_in_common <- lesion_acronyms[progression_in_common] %>%
+    set_names(progression_in_common)
+  data_trend %>%
+    mutate(
+        {{predictor_var_sym}} := as.character({{predictor_var_sym}})
+    ) %>%
+    left_join(
+      data_sexit %>%
+        separate(contrast, c("contrast_target", "contrast_ref"), sep = " - ") %>%
+        filter(contrast_ref == progression_in_common[1]),
+        # mutate(
+        #   across(starts_with("contrast"), ~str_replace_all(.x, r"{\(|\)}", "")),
+        #   across(starts_with("contrast"), ~ordered(.x, levels = progression_levels))
+        # ),
+      by = join_by({{predictor_var_sym}} == "contrast_target", "target_name")
+    ) %>%
+    mutate(
+        {{predictor_var_sym}} := ordered(lesion_acronyms_in_common[{{predictor_var_sym}}], levels = lesion_acronyms_in_common)
+    ) %>%
+    group_by(target_name, lesions_categories_all) %>%
+    ggdist::median_qi(.epred, .width = c(.95)) %>%
+    # filter(.width == .95) %>%
+    ggplot(
+      aes(
+        x = {{predictor_var_sym}},
+        y = .epred,
+        color = target_name
+      )
+    ) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_ribbon(
+        aes(
+          ymin = .lower,
+          ymax = .upper,
+          fill = target_name,
+          group = target_name
+        ),
+        alpha = 0.1,
+        color = NA
+      ) +
+      geom_line(
+        aes(group = target_name)
+      ) +
+      # geom_lineribbon(
+      #   aes(
+      #     fill_ramp = after_stat(cut_cdf_qi(cdf, .width = c(0.2, 0.8)))
+      #   ),
+      #   alpha = 0.5
+      # ) +
+      ggokabeito::scale_color_okabe_ito() +
+      ggokabeito::scale_fill_okabe_ito(guide = "none") +
+      theme_minimal(base_family = "Helvetica") +
+      # theme(
+      #   panel.grid.minor = element_blank(),
+      #   panel.grid.major.x = element_blank()
+      # ) +
+      labs(
+        x = "Lesion type",
+        y = "Normalized expression",
+        color = "Gene"
+      )
+}
+
+progression_models_by_gene_progression_plots <- progression_models_plot_data_by_gene_set %>%
+  # Only make colored plots if set has less than 10 genes
+  filter(
+    map_lgl(
+      trend_by_gene,
+      \(x) ungroup(x) %>% distinct(target_name) %>% nrow() %>% magrittr::is_less_than(10)
+    )
+  ) %>%
+  # slice_head(n = 1) %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      make_trend_by_gene_plot(
+        trend_by_gene, sexit_by_gene, predictor_var, cancer_progression
+      )
+    )
+  ) %>%
+  ungroup()
+
+dir.create("plots/progression_models_post_draws/all_progression/by_gene_line_plots_colored/", showWarnings = FALSE)
+pwalk(
+  progression_models_by_gene_progression_plots,
+  function(Cell_Types, sample_type, gene_set, p, trend_by_gene, ...) {
+    message(paste("Saving", gene_set))
+    ggsave(
+      file.path(
+        "plots/progression_models_post_draws/all_progression/by_gene_line_plots_colored/",
+        paste0(Cell_Types, "_", sample_type, "_", str_replace_all(gene_set, fixed("/"), ""), ".pdf")
+      ),
+      p,
+      width = 5, height = 3,
+      # For unicode compatibility
+      device = Cairo::CairoPDF
+    )
+  }
+)
+```
+
+#### Shaded line labeled
+
+```{r}
+library(ggrepel)
+make_trend_by_gene_plot <- function(data_trend, data_sexit, predictor_var, progression_levels) {
+  # browser()
+  predictor_var_sym <- rlang::sym(predictor_var)
+  progression_in_common <- intersect(progression_levels, levels(data_trend[[predictor_var]]))
+  lesion_acronyms_in_common <- lesion_acronyms[progression_in_common] %>%
+    set_names(progression_in_common)
+  data_trend %>%
+    mutate(
+        {{predictor_var_sym}} := as.character({{predictor_var_sym}})
+    ) %>%
+    left_join(
+      data_sexit %>%
+        separate(contrast, c("contrast_target", "contrast_ref"), sep = " - ") %>%
+        filter(contrast_ref == progression_in_common[1]),
+        # mutate(
+        #   across(starts_with("contrast"), ~str_replace_all(.x, r"{\(|\)}", "")),
+        #   across(starts_with("contrast"), ~ordered(.x, levels = progression_levels))
+        # ),
+      by = join_by({{predictor_var_sym}} == "contrast_target", "target_name")
+    ) %>%
+    mutate(
+        {{predictor_var_sym}} := ordered(lesion_acronyms_in_common[{{predictor_var_sym}}], levels = lesion_acronyms_in_common)
+    ) %>%
+    group_by(target_name, lesions_categories_all) %>%
+    ggdist::median_qi(.epred, .width = c(.95)) %>%
+    # filter(.width == .95) %>%
+    ggplot(
+      aes(
+        x = {{predictor_var_sym}},
+        y = .epred
+      )
+    ) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      # geom_ribbon(
+      #   aes(
+      #     ymin = .lower,
+      #     ymax = .upper,
+      #     group = target_name
+      #   ),
+      #   alpha = 0.1,
+      #   color = NA,
+      #   fill = "black"
+      # ) +
+      geom_line(
+        aes(group = target_name),
+        alpha = 0.8
+      ) +
+      ggrepel::geom_text_repel(
+        aes(
+          label = target_name
+        ),
+        data = \(x) x %>%
+          # only retain last stage
+          filter(
+            {{predictor_var_sym}} == last(lesion_acronyms_in_common)
+          ),
+        # force = .5,
+        force_pull = 0,
+        nudge_x = .5,
+        hjust = 0,
+        # segment.size = .2,
+        # vjust = .5,
+        direction = "y",
+        angle = 0,
+        max.iter = 1e5,
+        max.time = 5,
+        segment.linetype = "dotted",
+        # segment.size = .2,
+        max.overlaps = Inf,
+        size = 2
+        # position = position_nudge(x = .2)
+      ) +
+      # ggrepel::geom_label_repel(
+      #   aes(
+      #     label = target_name
+      #   ),
+      #   data = \(x) x %>%
+      #     # only retain last stage
+      #     filter(
+      #       {{predictor_var_sym}} == last(lesion_acronyms_in_common)
+      #     ) %>%
+      #     mutate(target_name = " "),
+      #   force = .5,
+      #   force_pull = 0,
+      #   nudge_x = .2,
+      #   hjust = 0,
+      #   # vjust = .5,
+      #   direction = "y",
+      #   segment.linetype = "dotted",
+      #   # segment.size = .2,
+      #   # max.overlaps = Inf,
+      #   size = 2
+      #   # position = position_nudge(x = .2)
+      # ) +
+      # ggrepel::geom_label_repel(
+      #   aes(
+      #     label = target_name
+      #   ),
+      #   data = \(x) x %>%
+      #     # only retain last stage
+      #     filter(
+      #       {{predictor_var_sym}} == last(lesion_acronyms_in_common)
+      #     ) %>%
+      #     mutate(target_name = paste0("  ", target_name)),
+      #   force = .5,
+      #   nudge_x = .2,
+      #   hjust = 0,
+      #   # vjust = .5,
+      #   direction = "y",
+      #   segment.linetype = "dotted",
+      #   segment.color = NA,
+      #   segment.alpha = 0,
+      #   # segment.size = .2,
+      #   # max.overlaps = Inf,
+      #   size = 2
+      #   # position = position_nudge(x = .2)
+      # ) +
+      scale_x_discrete(
+        expand = expansion(add = c(0, 1.5))
+      ) +
+      # geom_lineribbon(
+      #   aes(
+      #     fill_ramp = after_stat(cut_cdf_qi(cdf, .width = c(0.2, 0.8)))
+      #   ),
+      #   alpha = 0.5
+      # ) +
+      theme_minimal(base_family = "Helvetica") +
+      # theme(
+      #   panel.grid.minor = element_blank(),
+      #   panel.grid.major.x = element_blank()
+      # ) +
+      labs(
+        x = "Lesion type",
+        y = "Normalized expression",
+        color = "Gene"
+      )
+}
+
+progression_models_by_gene_progression_plots <- progression_models_plot_data_by_gene_set %>%
+  # slice_head(n = 1) %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      make_trend_by_gene_plot(
+        trend_by_gene, sexit_by_gene, predictor_var, cancer_progression
+      )
+    )
+  ) %>%
+  ungroup()
+
+dir.create("plots/progression_models_post_draws/all_progression/by_gene_line_plots/", showWarnings = FALSE)
+pwalk(
+  progression_models_by_gene_progression_plots,
+  function(Cell_Types, sample_type, gene_set, p, trend_by_gene, ...) {
+    message(paste("Saving", gene_set))
+    ggsave(
+      file.path(
+        "plots/progression_models_post_draws/all_progression/by_gene_line_plots/",
+        paste0(Cell_Types, "_", sample_type, "_", str_replace_all(gene_set, fixed("/"), ""), ".pdf")
+      ),
+      p,
+      width = 5, height = 3,
+      # For unicode compatibility
+      device = Cairo::CairoPDF
+    )
+  }
+)
+```
+
+#### Heatmaps
+
+```{r}
+library(seriation)
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  # browser()
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+
+# Threshold favors one color over the other
+better_contrast <- function(
+  colors1, colors2, threshold = 0
+) {
+  # browser()
+  farver::compare_colour(
+    farver::decode_colour(colors1),
+    farver::decode_colour(colors2),
+    from_space = "rgb",
+    method = "cie2000"
+  ) %>% {
+      .[, 1] < (1 + threshold) * .[, 2]
+    } %>%
+    if_else(colors2[2], colors2[1])
+}
+
+library(farver)
+make_trend_by_gene_hm <- function(data_trend, data_sexit, predictor_var, progression_levels) {
+  # browser()
+  predictor_var_sym <- rlang::sym(predictor_var)
+  progression_in_common <- intersect(progression_levels, levels(data_trend[[predictor_var]]))
+  lesion_acronyms_in_common <- lesion_acronyms[progression_in_common] %>%
+    set_names(progression_in_common)
+  data_trend_trans <- data_trend %>%
+    ungroup() %>%
+    group_by(target_name, lesions_categories_all) %>%
+    ggdist::median_qi(.epred, .width = c(.95)) %>%
+    left_join(
+      data_sexit %>%
+        separate(contrast, c("contrast_target", "contrast_ref"), sep = " - ") %>%
+        filter(contrast_ref == progression_in_common[1]) %>%
+        transmute(
+          target_name,
+          contrast_target,
+          significant_stars = fct_recode(
+            significant,
+            !!!c(
+              "**" = ">99%",
+              "*" = ">95%",
+              " " = "<95%"
+            )
+          )
+        ),
+      by = join_by({{predictor_var_sym}} == "contrast_target", "target_name")
+    ) %>%
+    cluster_df({{predictor_var_sym}}, target_name, .epred) %>%
+    mutate(
+      {{predictor_var_sym}} := ordered(lesion_acronyms_in_common[as.character({{predictor_var_sym}})], levels = lesion_acronyms_in_common)
+    )
+  data_trend_trans %>%
+    ggplot(
+      aes(
+        x = target_name,
+        y = fct_rev({{predictor_var_sym}}),
+        fill = .epred
+      )
+    ) +
+      geom_raster() +
+      geom_text(
+        aes(
+          label = significant_stars,
+          # Try to automatically determine whether color should be black
+          # or white based on contrast to background
+          color = after_scale(better_contrast(fill, c("white", "black"), 0))
+        ),
+        hjust = .5, vjust = .5
+      ) +
+      theme_minimal(base_family = "Helvetica") +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0)
+      ) +
+      scico::scale_fill_scico(
+        palette = "vik", midpoint = 0
+      ) +
+      scale_color_identity() +
+      # scale_color_manual(values = c(`1` = "pink", `2` = "green")) +
+      scale_x_discrete(position = "top") +
+      coord_equal() +
+      labs(
+        x = NULL,
+        y = NULL,
+        fill = "Normalized\nexpression",
+      )
+}
+
+
+progression_models_by_gene_progression_hms <-progression_models_plot_data_by_gene_set %>%
+  # slice_head(n = 1) %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      make_trend_by_gene_hm(
+        trend_by_gene, sexit_by_gene, predictor_var, cancer_progression
+      )
+    )
+  ) %>%
+  ungroup()
+
+dir.create("plots/progression_models_post_draws/all_progression/by_gene_heatmaps/", showWarnings = FALSE)
+pwalk(
+  progression_models_by_gene_progression_hms,
+  function(Cell_Types, sample_type, gene_set, p, trend_by_gene, ...) {
+    message(paste("Saving", gene_set))
+    width <- trend_by_gene %>%
+      ungroup() %>%
+      distinct(target_name) %>%
+      nrow() %>%
+      magrittr::multiply_by(.3) %>%
+      magrittr::add(2)
+    ggsave(
+      file.path(
+        "plots/progression_models_post_draws/all_progression/by_gene_heatmaps/",
+        paste0(Cell_Types, "_", sample_type, "_", str_replace_all(gene_set, fixed("/"), ""), ".pdf")
+      ),
+      p,
+      width = width, height = 2.5,
+      device = pdf
+    )
+  }
+)
+```
+
+

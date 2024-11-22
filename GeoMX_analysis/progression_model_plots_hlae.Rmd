@@ -1,0 +1,695 @@
+---
+title: "Tumor progression models plots HLA-E included"
+author: "Clemens Hug"
+date: "2024-01-23"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(qs)
+library(synExtra)
+library(data.table)
+library(powerjoin)
+
+theme_set(theme_minimal(base_family = "Helvetica"))
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+syn_inputs <- c(
+  gene_sets = "syn52658610",
+  meta = "syn52658612",
+  count_matrices = "syn52658861",
+  progression_model_post_draws = "syn53360595",
+  progression_model_global_sexit = "syn53360577",
+  progression_model_warnings = "syn53361344",
+  gene_sets_unique = "syn52658611",
+  progresssion_model_post_draws_cat = "syn53451522",
+  progression_model_global_sexit_cat = "syn53451496",
+  progression_model_warnings_cat = "syn53451523"
+)
+
+syn_files <- syn_inputs %>%
+  map(syn)
+
+gene_sets <- read_csv(syn_files[["gene_sets"]])
+
+gene_sets_unique <- qread(syn_files[["gene_sets_unique"]])
+
+meta <- read_csv(syn_files[["meta"]])
+
+progression_model_post_draws <- qread(syn_files[["progression_model_post_draws"]])
+progression_model_global_sexit <- qread(syn_files[["progression_model_global_sexit"]])
+progression_model_warnings <- read_csv(syn_files[["progression_model_warnings"]])
+
+progression_model_post_draws_cat <- qread(syn_files[["progresssion_model_post_draws_cat"]])
+progression_model_global_sexit_cat <- qread(syn_files[["progression_model_global_sexit_cat"]])
+progression_model_warnings_cat <- read_csv(syn_files[["progression_model_warnings_cat"]])
+
+```
+
+## Progression model
+
+```{r}
+lesion_acronyms <- c(
+  "FT" = "FT",
+  "Fimbriae" = "Fim",
+  "p53 signature" = "p53",
+  "STIL" = "STIL",
+  "STIC" = "STIC",
+  "Inv Cancer" = "Tumor"
+)
+
+meta_processed <- meta %>%
+  mutate(
+    lesion_acronym = str_replace_all(
+      Lesions_categories_All, coll(lesion_acronyms)
+    )
+  )
+
+incidental_progression <- c(
+  "FT",
+  "Fimbriae",
+  "p53 signature",
+  "STIC"
+)
+
+cancer_progression <- c(
+  "FT",
+  "Fimbriae",
+  "p53 signature",
+  "STIC",
+  "Inv Cancer"
+)
+```
+
+
+## Visualize warnings
+
+```{r}
+
+library(seriation)
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+    mat <- df %>%
+        select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+        pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+        column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+    # browser()
+    if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+      dist_rows <- dist(mat, method = "euclidian")
+      dist_cols <- dist(t(mat), method = "euclidian")
+    } else {
+      # browser()
+      dist_rows <- cluster::daisy(mat, metric = "gower")
+      dist_cols <- t(mat) %>%
+        as.data.frame() %>%
+        mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+        cluster::daisy(metric = "gower")
+    }
+    clust_rows <- hclust(dist_rows, method = "average") %>%
+        reorder(dist_rows, method = "olo")
+    clust_cols <- hclust(dist_cols, method = "average") %>%
+        reorder(dist_cols, method = "olo")
+    df %>%
+        mutate(
+            "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+            "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+        )
+}
+
+plot_n_divergent <- function(res_warnings) {
+  res_warnings %>%
+    mutate(
+      cell_type_sample_type = paste(
+        Cell_Types, sample_type
+      )
+    ) %>%
+    cluster_df(
+      gene_set, cell_type_sample_type, n_divergent,
+      values_fill = 0
+    ) %>%
+    ggplot(
+      aes(
+        cell_type_sample_type,
+        gene_set,
+        fill = n_divergent
+      )
+    ) +
+      geom_raster() +
+      scale_fill_viridis_c(trans = "log10") +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+      )
+}
+
+p <- plot_n_divergent(progression_model_warnings)
+
+ggsave(
+  "plots/progression_model_res_n_divergent_hlae.pdf",
+  p,
+  width = 10, height = 10, device = Cairo::CairoPDF
+)
+
+p <- plot_n_divergent(progression_model_warnings_cat)
+
+ggsave(
+  "plots/progression_model_res_n_divergent_hlae_cat.pdf",
+  p,
+  width = 10, height = 10, device = Cairo::CairoPDF
+)
+
+plot_convergence <- function(res_warnings) {
+  res_warnings %>%
+    mutate(
+      cell_type_sample_type = paste(
+        Cell_Types, sample_type
+      ),
+      convergence = if_else(
+        not_converged, "no convergence", "convergence"
+      ) %>%
+        as.factor()
+    ) %>%
+    cluster_df(
+      gene_set, cell_type_sample_type, convergence,
+      values_fill = "convergence"
+    ) %>%
+    ggplot(
+      aes(
+        cell_type_sample_type,
+        gene_set,
+        fill = convergence
+      )
+    ) +
+      geom_raster() +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+      )
+}
+
+p <- plot_convergence(progression_model_warnings)
+
+ggsave(
+  "plots/progression_model_res_convergence_hlae.pdf",
+  p,
+  width = 10, height = 10, device = Cairo::CairoPDF
+)
+
+```
+
+
+
+## Global plots
+
+```{r}
+prepare_plot_data <- function(
+  post_draws,
+  global_sexit,
+  warnings
+) {
+  # browser()
+  post_draws %>%
+    inner_join(
+      global_sexit
+    ) %>%
+    inner_join(
+      gene_sets %>%
+        distinct(gene_set_group, gene_set)
+    ) %>%
+    group_by(
+      Cell_Types, sample_type, predictor_var, model_type, predictor_term,
+      model_formula, gene_set_group
+    ) %>%
+    summarize(
+      across(
+        where(is.list),
+        \(x) list(bind_rows(set_names(x, gene_set), .id = "gene_set"))
+      ),
+      .groups = "drop"
+    ) %>%
+    inner_join(
+      warnings %>%
+        select(
+          gene_set, warning_message = warnings,
+          not_converged,
+          n_divergent, Cell_Types, sample_type, model_type,
+          predictor_var, predictor_term
+        ) %>%
+        inner_join(
+          gene_sets %>%
+            distinct(gene_set_group, gene_set)
+        ) %>%
+        group_nest(
+          gene_set_group, Cell_Types, sample_type, model_type,
+          predictor_var, predictor_term,
+          .key = "warnings"
+        )
+    )
+}
+
+progression_model_plot_data <- prepare_plot_data(
+  progression_model_post_draws,
+  progression_model_global_sexit,
+  progression_model_warnings
+)
+
+progression_model_plot_data_cat <- prepare_plot_data(
+  progression_model_post_draws_cat,
+  progression_model_global_sexit_cat,
+  progression_model_warnings_cat
+)
+```
+
+```{r}
+GeomSplitViolin <- ggproto("GeomSplitViolin", GeomViolin,
+                           draw_group = function(self, data, ..., draw_quantiles = NULL) {
+  data <- transform(data, xminv = x - violinwidth * (x - xmin), xmaxv = x + violinwidth * (xmax - x))
+  grp <- data[1, "group"]
+  newdata <- plyr::arrange(transform(data, x = if (grp %% 2 == 1) xminv else xmaxv), if (grp %% 2 == 1) y else -y)
+  newdata <- rbind(newdata[1, ], newdata, newdata[nrow(newdata), ], newdata[1, ])
+  newdata[c(1, nrow(newdata) - 1, nrow(newdata)), "x"] <- round(newdata[1, "x"])
+
+  if (length(draw_quantiles) > 0 & !scales::zero_range(range(data$y))) {
+    stopifnot(all(draw_quantiles >= 0), all(draw_quantiles <=
+      1))
+    quantiles <- ggplot2:::create_quantile_segment_frame(data, draw_quantiles)
+    aesthetics <- data[rep(1, nrow(quantiles)), setdiff(names(data), c("x", "y")), drop = FALSE]
+    aesthetics$alpha <- rep(1, nrow(quantiles))
+    both <- cbind(quantiles, aesthetics)
+    quantile_grob <- GeomPath$draw_panel(both, ...)
+    ggplot2:::ggname("geom_split_violin", grid::grobTree(GeomPolygon$draw_panel(newdata, ...), quantile_grob))
+  }
+  else {
+    ggplot2:::ggname("geom_split_violin", GeomPolygon$draw_panel(newdata, ...))
+  }
+})
+
+geom_split_violin <- function(mapping = NULL, data = NULL, stat = "ydensity", position = "identity", ...,
+                              draw_quantiles = NULL, trim = TRUE, scale = "area", na.rm = FALSE,
+                              show.legend = NA, inherit.aes = TRUE) {
+  layer(data = data, mapping = mapping, stat = stat, geom = GeomSplitViolin,
+        position = position, show.legend = show.legend, inherit.aes = inherit.aes,
+        params = list(trim = trim, scale = scale, draw_quantiles = draw_quantiles, na.rm = na.rm, ...))
+}
+
+make_global_trend_plot <- function(
+  data_trend, data_sexit_hlae_by_stage, data_sexit_stages_by_hlae, data_warnings, predictor_var
+) {
+  # browser()
+  predictor_var_sym <- rlang::sym(predictor_var)
+  data_trend %>%
+    ungroup() %>%
+    left_join(
+      data_sexit_stages_by_hlae %>%
+        separate(contrast, c("contrast_target", "contrast_ref"), sep = " - ") %>%
+        mutate(
+          across(starts_with("contrast"), ~str_replace_all(.x, r"{\(|\)}", "")),
+          across(starts_with("contrast"), ~ordered(.x, levels = levels(data_trend[[predictor_var]])))
+        ) %>%
+        filter(contrast_ref == levels(data_trend[[predictor_var]])[1]),
+      by = join_by(!!predictor_var_sym == "contrast_target", "gene_set", "hlae_cycif_binary")
+    ) %>%
+    ggplot(
+      aes(x = !!predictor_var_sym, y = .epred, color = hlae_cycif_binary, fill = significant)
+    ) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_split_violin(
+        aes(group = paste(!!predictor_var_sym, hlae_cycif_binary)),
+        alpha = .9,
+        trim = TRUE
+      ) +
+      geom_text(
+        data = data_sexit_hlae_by_stage %>%
+          mutate(significant = case_match(significant, ">99%" ~ "**", ">95%" ~ "*", .default = "")),
+        aes(x = !!predictor_var_sym, label = significant),
+        y = Inf,
+        vjust = 1,
+        inherit.aes = FALSE,
+        # hide from legend
+        show.legend = FALSE
+      ) +
+      geom_text(
+        data = data_warnings,
+        aes(
+          label = paste(
+            if_else(n_divergent > 0, paste0("n divergent: ", n_divergent), ""),
+            if_else(not_converged, "not converged", ""), sep = "\n"
+          )
+        ),
+        inherit.aes = FALSE,
+        x = -Inf,
+        y = Inf,
+        hjust = 0, vjust = 1
+      ) +
+      facet_wrap(~gene_set, scales = "free_y", ncol = 1) +
+      scale_fill_viridis_d(
+        na.value = "grey",
+        labels = \(breaks) {breaks[is.na(breaks)] <- "reference"; breaks}
+      ) +
+      scale_color_manual(
+        values = c(
+          pos = "coral1",
+          neg = "aquamarine3"
+        )
+      ) +
+      labs(
+        x = "Lesion type",
+        y = "Normalized expression",
+        linetype = "Significance\nlevel",
+        color = "HLA-E\nstatus",
+        fill = "Significance\nlevel"
+      )
+}
+
+
+p <- make_global_trend_plot(
+  progression_models_plot_data$global_trend_by_hlae[[1]],
+  progression_models_plot_data$sexit_hlae_by_stage[[1]],
+  progression_models_plot_data$sexit_stages_by_hlae[[1]],
+  progression_models_plot_data$warnings[[1]],
+  "lesions_categories_all"
+)
+
+ggsave(
+  "test_plot.pdf", p, width = 8, height = 20
+)
+
+# p <- progression_models_global_trend %>%
+#   filter(gene_set %in% c("IRDS", "Proliferation", "TGF-B")) %>%
+#   make_global_trend_plot()
+# p
+
+global_trend_plots <- progression_models_plot_data %>%
+  rowwise() %>%
+  mutate(
+    p = {make_global_trend_plot(
+      global_trend_by_hlae,
+      sexit_hlae_by_stage,
+      sexit_stages_by_hlae,
+      warnings,
+      predictor_var
+    ) +
+      labs(
+        title = paste(Cell_Types, sample_type, gene_set_group),
+       )} %>%
+       list()
+  ) %>%
+  ungroup()
+
+
+dir.create("plots/progression_models_post_draws_hlae")
+pwalk(
+  global_trend_plots,
+  function(gene_set_group, predictor_var, p, Cell_Types, sample_type, warnings, ...) {
+    ggsave(
+      file.path("plots/progression_models_post_draws_hlae/", paste0("global_trend_", Cell_Types, "_", sample_type, "_", gene_set_group, ".pdf")),
+      p,
+      width = 6, height = 2 + nrow(warnings),
+      device = Cairo::CairoPDF
+    )
+  }
+)
+```
+
+#### By gene
+
+Packed with gene sets plotted together
+
+```{r}
+
+make_trend_by_gene_plot <- function(
+  data_trend, data_sexit_hlae_by_stage, data_sexit_stages_by_hlae, data_warnings, predictor_var
+) {
+  # browser()
+  predictor_var_sym <- rlang::sym(predictor_var)
+  facet_vars <- data_trend %>%
+    ungroup() %>%
+    distinct(gene_set, target_name)
+  facet_sizes <- facet_vars %>%
+    count(gene_set)
+  N <- nrow(facet_vars)
+  N_LARGEST <- max(facet_sizes$n)
+  TARGET_AR <- 1 / sqrt(2)
+  TARGET_NCOL <- sqrt(N * TARGET_AR)
+  TARGET_NROW <- max(TARGET_NCOL / TARGET_AR, N_LARGEST)
+  col_assignments <- BBmisc::binPack(
+    facet_sizes$n, TARGET_NROW
+  )
+  facet_sizes <- mutate(
+      facet_sizes,
+      col_assignment = col_assignments
+    )
+  ACTUAL_NROW = facet_sizes %>%
+    group_by(col_assignment) %>%
+    summarize(n = sum(n), .groups = "drop") %>%
+    pull(n) %>%
+    max()
+  facet_design <- facet_sizes %>%
+    group_nest(col_assignment) %>%
+    mutate(
+      col_design = accumulate(
+        data,
+        \(last, x) {
+          new_start <- max(last, na.rm = TRUE) + 1
+          vec <- rep_len(NA_integer_, ACTUAL_NROW)
+          pos <- seq(new_start, sum(x$n) + new_start - 1, by = 1)
+          vec[seq_len(sum(x$n))] <- pos
+          vec
+        }, .init = 0
+      )[-1]
+    )
+  gene_set_levels <- facet_sizes %>%
+    arrange(col_assignment, n) %>%
+    pull(gene_set)
+  facet_design_mat <- do.call(cbind, facet_design$col_design)
+  data_sexit_stages_by_hlae <- data_sexit_stages_by_hlae %>%
+    mutate(across(gene_set, \(x) factor(x, levels = gene_set_levels)))
+  data_trend <- data_trend %>%
+    mutate(across(gene_set, \(x) factor(x, levels = gene_set_levels))) %>%
+    ungroup() %>%
+    left_join(
+      data_sexit_stages_by_hlae %>%
+        separate(contrast, c("contrast_target", "contrast_ref"), sep = " - ") %>%
+        mutate(
+          across(starts_with("contrast"), ~str_replace_all(.x, r"{\(|\)}", "")),
+          across(starts_with("contrast"), ~ordered(.x, levels = levels(data_trend[[predictor_var]])))
+        ) %>%
+        filter(contrast_ref == levels(data_trend[[predictor_var]])[1]),
+      by = join_by(!!predictor_var_sym == "contrast_target", "gene_set", "hlae_cycif_binary", "target_name")
+    )
+  data_sexit_hlae_by_stage <- data_sexit_hlae_by_stage %>%
+    mutate(across(gene_set, \(x) factor(x, levels = gene_set_levels)))
+  data_warnings <- data_warnings %>%
+    mutate(across(gene_set, \(x) factor(x, levels = gene_set_levels)))
+  p <- data_trend %>%
+    ggplot(
+      aes(x = !!predictor_var_sym, y = .epred, color = hlae_cycif_binary, fill = significant)
+    ) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_split_violin(
+        aes(group = paste(!!predictor_var_sym, hlae_cycif_binary)),
+        linewidth = 0.3,
+        alpha = .95,
+        trim = TRUE
+      ) +
+      geom_text(
+        data = data_sexit_hlae_by_stage %>%
+          mutate(significant = case_match(significant, ">99%" ~ "**", ">95%" ~ "*", .default = "")),
+        aes(x = !!predictor_var_sym, label = significant),
+        y = Inf,
+        vjust = 1.2,
+        inherit.aes = FALSE,
+        # hide from legend
+        show.legend = FALSE
+      ) +
+      ggh4x::facet_manual(
+        vars(gene_set, target_name),
+        design = facet_design_mat,
+        strip.position = "left",
+        scales = "free_y",
+        strip = ggh4x::strip_nested()
+      ) +
+      scale_fill_viridis_d(
+        na.value = "grey",
+        labels = \(breaks) {breaks[is.na(breaks)] <- "reference"; breaks}
+      ) +
+      scale_color_manual(
+        values = c(
+          pos = "coral1",
+          neg = "aquamarine3"
+        )
+      ) +
+      labs(
+        x = "Lesion type",
+        y = "Normalized expression",
+        linetype = "Significance\nlevel",
+        color = "HLA-E\nstatus",
+        fill = "Significance\nlevel"
+      ) +
+      theme_light(base_family = "Helvetica") +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()
+      )
+  list(
+    p = p,
+    ncol = nrow(facet_design),
+    nrow = ACTUAL_NROW
+  )
+}
+
+# test_plot <- make_trend_by_gene_plot(
+#       progression_models_plot_data$trend_by_gene_by_hlae[[6]],
+#       progression_models_plot_data$sexit_hlae_by_stage_by_gene[[6]],
+#       progression_models_plot_data$sexit_stages_by_hlae_by_gene[[6]],
+#       progression_models_plot_data$warnings[[1]],
+#       "lesions_categories_all"
+#     )
+
+
+global_trend_plots_by_gene <- progression_models_plot_data %>%
+  rowwise() %>%
+  mutate(
+    p = make_trend_by_gene_plot(
+      trend_by_gene_by_hlae,
+      sexit_hlae_by_stage_by_gene,
+      sexit_stages_by_hlae_by_gene,
+      warnings,
+      predictor_var
+    ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+dir.create("plots/progression_models_post_draws_hlae/by_gene")
+pwalk(
+  global_trend_plots_by_gene,
+  function(gene_set_group, predictor_var, p, Cell_Types, sample_type, warnings, sexit_stages_by_hlae_by_gene, ...) {
+    message(paste0("global_trend_", Cell_Types, "_", sample_type, "_", gene_set_group, ".pdf"))
+    ggsave(
+      file.path("plots", "progression_models_post_draws_hlae", "by_gene", paste0("global_trend_", Cell_Types, "_", sample_type, "_", gene_set_group, "_packed.pdf")),
+      p$p +
+        labs(
+          title = paste(Cell_Types, sample_type, gene_set_group)
+        ),
+      width = 2 + p$ncol * 1.2, height = 2 + p$nrow * .8,
+      device = Cairo::CairoPDF
+    )
+  }
+)
+
+```
+
+
+```{r}
+
+make_trend_by_gene_plot <- function(
+  data_trend, data_sexit_hlae_by_stage, data_sexit_stages_by_hlae, data_warnings, predictor_var
+) {
+  # browser()
+  predictor_var_sym <- rlang::sym(predictor_var)
+  data_trend <- data_trend %>%
+    ungroup() %>%
+    left_join(
+      data_sexit_stages_by_hlae %>%
+        separate(contrast, c("contrast_target", "contrast_ref"), sep = " - ") %>%
+        mutate(
+          across(starts_with("contrast"), ~str_replace_all(.x, r"{\(|\)}", "")),
+          across(starts_with("contrast"), ~ordered(.x, levels = levels(data_trend[[predictor_var]])))
+        ) %>%
+        filter(contrast_ref == levels(data_trend[[predictor_var]])[1]),
+      by = join_by(!!predictor_var_sym == "contrast_target", "gene_set", "hlae_cycif_binary", "target_name")
+    )
+  p <- data_trend %>%
+    ggplot(
+      aes(x = !!predictor_var_sym, y = .epred, color = hlae_cycif_binary, fill = significant)
+    ) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_split_violin(
+        aes(group = paste(!!predictor_var_sym, hlae_cycif_binary)),
+        linewidth = 0.3,
+        alpha = .95,
+        trim = TRUE
+      ) +
+      geom_text(
+        data = data_sexit_hlae_by_stage %>%
+          mutate(significant = case_match(significant, ">99%" ~ "**", ">95%" ~ "*", .default = "")),
+        aes(x = !!predictor_var_sym, label = significant),
+        y = Inf,
+        vjust = 1.2,
+        inherit.aes = FALSE,
+        # hide from legend
+        show.legend = FALSE
+      ) +
+      ggh4x::facet_nested_wrap(
+        vars(gene_set, target_name),
+        strip.position = "top",
+        ncol = 8,
+        scales = "free_y",
+      ) +
+      scale_fill_viridis_d(
+        na.value = "grey",
+        labels = \(breaks) {breaks[is.na(breaks)] <- "reference"; breaks}
+      ) +
+      scale_color_manual(
+        values = c(
+          pos = "coral1",
+          neg = "aquamarine3"
+        )
+      ) +
+      labs(
+        x = "Lesion type",
+        y = "Normalized expression",
+        linetype = "Significance\nlevel",
+        color = "HLA-E\nstatus",
+        fill = "Significance\nlevel"
+      ) +
+      theme_light(base_family = "Helvetica") +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()
+      )
+  p
+}
+
+global_trend_plots_by_gene <- progression_models_plot_data %>%
+  rowwise() %>%
+  mutate(
+    p = make_trend_by_gene_plot(
+      trend_by_gene_by_hlae,
+      sexit_hlae_by_stage_by_gene,
+      sexit_stages_by_hlae_by_gene,
+      warnings,
+      predictor_var
+    ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+dir.create("plots/progression_models_post_draws_hlae/by_gene")
+pwalk(
+  global_trend_plots_by_gene,
+  function(gene_set_group, predictor_var, p, Cell_Types, sample_type, warnings, sexit_stages_by_hlae_by_gene, ...) {
+    message(paste0("global_trend_", Cell_Types, "_", sample_type, "_", gene_set_group, ".pdf"))
+    ggsave(
+      file.path("plots", "progression_models_post_draws_hlae", "by_gene", paste0("global_trend_", Cell_Types, "_", sample_type, "_", gene_set_group, ".pdf")),
+      p +
+        labs(
+          title = paste(Cell_Types, sample_type, gene_set_group)
+        ),
+      width = 10, height = 3 + floor(length(unique(sexit_stages_by_hlae_by_gene$target_name)) / 8) * 1.4,
+      device = Cairo::CairoPDF
+    )
+  }
+)
+
+
+```

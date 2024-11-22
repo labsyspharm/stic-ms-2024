@@ -1,0 +1,291 @@
+---
+title: ""
+author: "Clemens Hug"
+date: "2024-04-14"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(powerjoin)
+
+synapser::synLogin()
+
+syn <- synExtra::synDownloader("~/data", .cache = TRUE)
+```
+
+Data located at /n/files/HiTS/lsp-data/geomx_production/110-BRCA-Mutant-Ovarian-Precursors
+
+```{r}
+find_header_line <- function(filepath) {
+  lines <- readLines(filepath)
+  annotations_idx <- which(trimws(lines) == "Annotations")
+  if (length(annotations_idx) == 0) {
+    stop("Could not find 'Annotations' marker in file")
+  }
+  return(annotations_idx[1])
+}
+
+worksheets_raw <- synGlob("syn63943715", "*.txt") %>%
+  set_names(
+    map_chr(names(.), \(.x) str_remove(basename(.x), ".txt"))
+  ) %>%
+  map(syn) %>%
+  map(
+    \(x) read_tsv(x, skip = find_header_line(x))
+  )
+```
+
+```{r}
+worksheets <- worksheets_raw %>%
+  bind_rows(.id = "filename") %>%
+  mutate(
+    roi = str_remove_all(
+      roi, "[^[0-9]]"
+    ),
+    across(segment, \(x) str_replace(x, fixed("panck", ignore_case = TRUE), "PanCK")),
+    across(`scan name`, \(x) str_replace(x, fixed("scan"), "Scan")),
+    sample_id = paste(`scan name`, roi, segment, sep = " | "),
+    batch_id = str_match(filename, "p110_(e[0-9]+)")[, 2]
+  )
+
+```
+
+```{r}
+fastq_files_raw <- syn("syn63944168") %>%
+  read_lines()
+
+fastq_files <- tibble(
+  fastq_path = fastq_files_raw
+) %>%
+  separate_wider_regex(
+    fastq_path,
+    patterns = c(
+      ".*", dsp_id = "DSP-[0-9]+-[A-Z]-[A-Z][0-9]{2}", "_S[0-9]+_?", lane = "(?:L00[12])?", "_", read = "R[12]", ".*fastq.gz"
+    ),
+    cols_remove = FALSE
+  )
+```
+
+```{r}
+# Compare the overlap between sample IDs
+worksheet_ids <- worksheets %>% pull(Sample_ID) %>% unique()
+fastq_ids <- fastq_files %>% pull(dsp_id) %>% unique()
+
+overlap <- intersect(worksheet_ids, fastq_ids)
+only_in_worksheets <- setdiff(worksheet_ids, fastq_ids)
+only_in_fastq <- setdiff(fastq_ids, worksheet_ids)
+
+list(
+  overlap = overlap,
+  only_in_worksheets = only_in_worksheets,
+  only_in_fastq = only_in_fastq
+)
+```
+
+10 DSP IDs only in the worksheets, no fastqs. They must be missing due to QC?
+
+All IDs in fastqs accounted for.
+
+
+```{r}
+fastq_merges <- fastq_files %>%
+  filter(dsp_id %in% overlap) %>%
+  group_by(dsp_id, read) %>%
+  filter(n() > 1) %>%
+  summarise(
+    fastq_paths = list(fastq_path),
+    merged_path = paste0(dsp_id, "_", read, ".fastq.gz")[1],
+    merge_command = paste("cat", paste(fastq_path, collapse = " "), ">", merged_path),
+    .groups = "drop"
+  )
+
+fastq_merges$merge_command %>%
+  paste(collapse = "\n") %>%
+  clipr::write_clip()
+```
+
+
+```{r}
+fastq_files_final <- fastq_files %>%
+  anti_join(fastq_merges) %>%
+  bind_rows(
+    fastq_merges %>%
+      select(dsp_id, read, fastq_path = merged_path)
+  )
+
+fastq_files_final_wide <- fastq_files_final %>%
+  select(dsp_id, read, fastq_path) %>%
+  pivot_wider(names_from = read, values_from = fastq_path, names_glue = "fastq_{read}")
+```
+
+
+```{r}
+dcc_files_raw <- syn("syn63970085") %>%
+  read_tsv(col_names = "filename") %>%
+  mutate(
+    dsp_id = str_remove(filename, fixed(".dcc")) %>%
+      str_remove(fixed("./"))
+  )
+
+
+```
+
+```{r}
+input_files_all <- worksheets %>%
+  power_left_join(
+    fastq_files_final_wide,
+    by = c("Sample_ID" = "dsp_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  power_left_join(
+    dcc_files_raw %>%
+      select(dsp_id, dcc = filename),
+    by = c("Sample_ID" = "dsp_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn"
+    )
+  )
+
+
+```
+
+```{r}
+meta_raw <- syn("syn63987479") %>%
+  readxl::read_excel() %>%
+  mutate(
+    across(`Segment (Name/ Label)`, \(x) str_replace(x, fixed("panck", ignore_case = TRUE), "PanCK")),
+    across(`Scan name`, \(x) str_replace(x, fixed("scan"), "Scan")),
+    sample_id = paste(`Scan name`, `ROI (label)`, `Segment (Name/ Label)`, sep = " | ")
+  )
+
+
+intersect(meta_raw$`Scan name`, worksheets$`scan name`)
+setdiff(meta_raw$`Scan name`, worksheets$`scan name`)
+setdiff(worksheets$`scan name`, meta_raw$`Scan name`)
+
+
+intersect(meta_raw$sample_id, worksheets$sample_id)
+setdiff(meta_raw$sample_id, worksheets$sample_id)
+setdiff(worksheets$sample_id, meta_raw$sample_id)
+```
+
+```{r}
+meta <- meta_raw %>%
+  drop_na(Cell_Types) %>%
+  power_inner_join(
+    worksheets %>%
+      select(sample_id, batch_id, dsp_id = Sample_ID),
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  transmute(
+    `library name` = sample_id,
+    `title` = paste(PatientID, batch_id, Lesions_Types, Cell_Types, sample_id, sep = ", "),
+    `organism` = "human",
+    tissue = "high grade serous ovarian carcinoma",
+    `cell line` = "Not applicable",
+    `cell type` = Cell_Types,
+    genotype = "Not applicable",
+    treatment = "Not applicable",
+    molecule = "total RNA",
+    `single or paired-end` = "paired-end",
+    `instrument model` = "Illumina NovaSeq 6000",
+    description = "FFPE",
+    `lesion type` = Lesions_Types,
+    `BRCA status` = BRCA_status,
+    `primary cancer stage` = Stage_PrimaryCa,
+    `patient id` = PatientID,
+    `batch` = batch_id,
+    dsp_id
+  )
+
+
+meta_with_files <- meta %>%
+  power_inner_join(
+    input_files_all %>%
+      transmute(
+        dsp_id = Sample_ID,
+        across(
+          c(fastq_R1, fastq_R2, dcc),
+          \(x) str_remove(x, fixed("./"))
+        )
+      ),
+    by = "dsp_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  drop_na(fastq_R1, fastq_R2, dcc)
+
+meta_with_files %>%
+  count(`library name`) %>%
+  count(n)
+
+meta_with_files %>%
+  count(title) %>%
+  count(n)
+
+meta_with_files %>% clipr::write_clip()
+
+used_fastq <- meta_with_files %>%
+  select(fastq_R1, fastq_R2) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "read",
+    values_to = "fastq"
+  ) %>%
+  pull(fastq) %>%
+  unique()
+clipr::write_clip(used_fastq)
+
+used_dcc <- meta_with_files %>%
+  pull(dcc) %>%
+  unique()
+clipr::write_clip(used_dcc)
+```
+
+
+```{r}
+md5_raw <- syn("syn63970232") %>%
+  read_delim("  ", col_names = c("md5", "filename"), trim_ws = TRUE) %>%
+  mutate(
+    across(filename, basename)
+  )
+
+used_md5 <- md5_raw %>%
+  power_inner_join(
+    meta_with_files %>%
+      select(fastq_R1, fastq_R2, dcc) %>%
+      pivot_longer(
+        cols = everything(),
+        names_to = "type",
+        values_to = "filename"
+      ),
+    by = "filename",
+    check = check_specs(
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn"
+    )
+  )
+
+clipr::write_clip(used_md5)
+```

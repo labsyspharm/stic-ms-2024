@@ -1,0 +1,1852 @@
+---
+title: "Tumor progression models"
+author: "Clemens Hug"
+date: "2023-10-16"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(qs)
+library(brms)
+library(tidybayes)
+library(emmeans)
+library(bayestestR)
+library(synExtra)
+library(data.table)
+library(powerjoin)
+library(batchtools)
+
+theme_set(theme_minimal(base_family = "Helvetica"))
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+syn_inputs <- c(
+  gene_sets = "syn52658610",
+  meta = "syn52658612",
+  count_matrices = "syn52658861",
+  gene_sets_unique = "syn52658611"
+)
+
+base_syn <- "syn52658402"
+progression_syn <- synMkdir(base_syn, "modeling", "all_progression")
+
+syn_files <- syn_inputs %>%
+  map(syn)
+
+gene_sets <- read_csv(syn_files[["gene_sets"]])
+
+gene_sets_unique <- qread(syn_files[["gene_sets_unique"]])
+
+meta <- read_csv(syn_files[["meta"]])
+
+count_matrices <- syn_files[["count_matrices"]] %>%
+  fread() %>%
+  as_tibble()
+```
+
+## Progression by patient
+
+Scale again for each subset of samples so that mean is always
+zero and standard deviation is one.
+
+```{r}
+lesion_acronyms <- c(
+  "FT" = "FT",
+  "Fimbriae" = "Fim",
+  "p53 signature" = "p53",
+  "STIL" = "STIL",
+  "STIC" = "STIC",
+  "Inv Cancer" = "Tumor"
+)
+
+meta_processed <- meta %>%
+  mutate(
+    lesion_acronym = str_replace_all(
+      Lesions_categories_All, coll(lesion_acronyms)
+    )
+  )
+
+incidental_progression <- c(
+  "FT",
+  "Fimbriae",
+  "p53 signature",
+  "STIC"
+)
+
+cancer_progression <- c(
+  "FT",
+  "Fimbriae",
+  "p53 signature",
+  "STIC",
+  "Inv Cancer"
+)
+
+progression_by_patient <- meta_processed %>%
+  mutate(
+    hlae_cycif_binary = recode(
+      `Lesions_Types_HLA-E status`,
+      low = "pos",
+      high = "pos"
+    ) %>%
+      factor(levels = c("neg", "pos")),
+  ) %>%
+  filter(
+    case_when(
+      sample_type == "incidental" ~ Lesions_categories_All %in% incidental_progression,
+      sample_type == "cancer" ~ Lesions_categories_All %in% cancer_progression,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  group_nest(Cell_Types, sample_type, .key = "meta") %>%
+  mutate(
+    meta = map2(
+      meta, sample_type,
+      \(m, st) {
+        mutate(
+          m,
+          Lesions_categories_All = ordered(
+            Lesions_categories_All,
+            levels = if (st == "incidental") incidental_progression else cancer_progression
+          ),
+          lesion_acronym = ordered(
+            lesion_acronym,
+            levels = lesion_acronyms[if (st == "incidental") incidental_progression else cancer_progression]
+          )
+        )
+      }
+    ),
+    count_progression = map2(
+      meta, sample_type,
+      \(m, st) {
+        power_inner_join(
+          m,
+          count_matrices %>%
+            filter(sample_type == st) %>%
+            select(-sample_type) %>%
+            group_by(TargetName) %>%
+            mutate(
+              across(
+                c(log_scaled, raw_scaled),
+                \(x) scale(x, center = TRUE, scale = TRUE)[, 1]
+              )
+            ) %>%
+            ungroup(),
+          by = "sample_id",
+          check = check_specs(
+            duplicate_keys_left = "warn",
+            unmatched_keys_left = "warn"
+          )
+        )
+      }
+    )
+  )
+```
+
+
+```{r}
+make_progression_plot <- function(
+  data, gs_name, gs_genes, progression_col = Lesions_categories_All
+) {
+  # browser()
+  progression_by_patient_agg <- data %>%
+    filter(
+      TargetName %in% gs_genes,
+    ) %>%
+    drop_na({{progression_col}}) %>%
+    group_by(
+      `Scan name`,
+      TargetName,
+      {{progression_col}}
+    ) %>%
+    summarize(
+      across(c(log_scaled, raw_scaled, log_unscaled, raw_unscaled), mean),
+      .groups = "drop"
+    )
+
+  progression_by_patient_stage_means <- progression_by_patient_agg %>%
+    group_by(
+      {{progression_col}},
+      TargetName
+    ) %>%
+    summarize(
+      across(c(log_scaled, raw_scaled, log_unscaled, raw_unscaled), .fns = list(mean = mean)),
+      .groups = "drop"
+    )
+
+  progression_by_patient_mean_relative <- progression_by_patient_agg %>%
+    left_join(
+      progression_by_patient_stage_means,
+      by = join_by(TargetName, {{progression_col}})
+    ) %>%
+    group_by(
+      `Scan name`,
+      TargetName
+    ) %>%
+    mutate(
+      count_relative = log_unscaled / mean(
+        log_unscaled[as.integer({{progression_col}}) == min(as.integer({{progression_col}}))]
+      ),
+      count_relative_mean = log_unscaled - mean(
+        log_unscaled[as.integer({{progression_col}}) == min(as.integer({{progression_col}}))]
+      ) + log_unscaled_mean
+    ) %>%
+    ungroup()
+
+  p1 <- progression_by_patient_mean_relative %>%
+    ggplot(
+      aes(
+        {{progression_col}},
+        count_relative,
+        group = `Scan name`
+      )
+    ) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~TargetName, scales = "free_y")
+
+  p2 <- progression_by_patient_agg %>%
+    ggplot(
+      aes(
+        {{progression_col}},
+        log_unscaled,
+        group = `Scan name`
+      )
+    ) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~TargetName, scales = "free_y")
+
+    p3 <- progression_by_patient_mean_relative %>%
+    ggplot(
+      aes(
+        {{progression_col}},
+        count_relative_mean,
+        group = `Scan name`
+      )
+    ) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~TargetName, scales = "free_y")
+
+  list(
+    progression_relative = p1,
+    progression_log_raw = p2,
+    progression_relative_mean = p3
+  )
+}
+
+gene_sets_for_plotting <- gene_sets %>%
+  group_by(gene_set_group, gene_set) %>%
+  summarize(genes = list(gene), .groups = "drop")
+
+progression_plots <- gene_sets_for_plotting %>%
+  cross_join(
+    progression_by_patient
+  ) %>%
+  rowwise() %>%
+  mutate(
+    plots = make_progression_plot(count_progression, gene_set, genes, progression_col = lesion_acronym) %>%
+      list()
+  ) %>%
+  ungroup() %>%
+  unnest_longer(plots, values_to = "plot", indices_to = "plot_type")
+
+dir.create("plots/progression_plots")
+pwalk(
+  progression_plots %>%
+    select(-meta, -count_progression) %>%
+    nest(data = c(plot, plot_type)),
+  function(gene_set, gene_set_group, Cell_Types, sample_type, data, ...) {
+    ggsave(
+      file.path("plots/progression_plots", paste0(gene_set_group, "_", str_replace_all(gene_set, fixed("/"), "_"), "_", sample_type, "_", Cell_Types, ".pdf")),
+      egg::ggarrange(
+        plots = data$plot,
+        ncol = 1,
+        draw = FALSE
+      ),
+      width = 10, height = 25
+    )
+  }
+)
+```
+
+
+
+```{r}
+make_progression_plot_hlae <- function(
+  data, gs_name, gs_genes, progression_col = Lesions_categories_All,
+  group_by_col = hlae_cycif_binary
+) {
+  # browser()
+  progression_by_patient_agg <- data %>%
+    filter(
+      TargetName %in% gs_genes,
+    ) %>%
+    drop_na({{progression_col}}) %>%
+    group_by(
+      `Scan name`,
+      TargetName,
+      {{progression_col}},
+      {{group_by_col}}
+    ) %>%
+    summarize(
+      across(c(log_scaled, raw_scaled, log_unscaled, raw_unscaled), mean),
+      .groups = "drop"
+    )
+
+  progression_by_patient_stage_means <- progression_by_patient_agg %>%
+    group_by(
+      {{progression_col}},
+      {{group_by_col}},
+      TargetName
+    ) %>%
+    summarize(
+      across(c(log_scaled, raw_scaled, log_unscaled, raw_unscaled), .fns = list(mean = mean)),
+      .groups = "drop"
+    )
+
+  progression_by_patient_mean_relative <- progression_by_patient_agg %>%
+    left_join(
+      progression_by_patient_stage_means,
+      by = join_by(TargetName, {{progression_col}}, {{group_by_col}})
+    ) %>%
+    group_by(
+      `Scan name`,
+      TargetName,
+      {{group_by_col}}
+    ) %>%
+    mutate(
+      count_relative = log_unscaled / mean(
+        log_unscaled[as.integer({{progression_col}}) == min(as.integer({{progression_col}}))]
+      ),
+      count_relative_mean = log_unscaled - mean(
+        log_unscaled[as.integer({{progression_col}}) == min(as.integer({{progression_col}}))]
+      ) + log_unscaled_mean
+    ) %>%
+    ungroup()
+
+  p1 <- progression_by_patient_mean_relative %>%
+    ggplot(
+      aes(
+        {{progression_col}},
+        count_relative,
+        group = paste(`Scan name`, {{group_by_col}}),
+        color = {{group_by_col}}
+      )
+    ) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~TargetName, scales = "free_y")
+
+  p2 <- progression_by_patient_agg %>%
+    ggplot(
+      aes(
+        {{progression_col}},
+        log_unscaled,
+        group = paste(`Scan name`, {{group_by_col}}),
+        color = {{group_by_col}}
+      )
+    ) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~TargetName, scales = "free_y")
+
+    p3 <- progression_by_patient_mean_relative %>%
+    ggplot(
+      aes(
+        {{progression_col}},
+        count_relative_mean,
+        group = paste(`Scan name`, {{group_by_col}}),
+        color = {{group_by_col}}
+      )
+    ) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~TargetName, scales = "free_y")
+
+  list(
+    progression_relative = p1,
+    progression_log_raw = p2,
+    progression_relative_mean = p3
+  )
+}
+
+gene_sets_for_plotting <- gene_sets %>%
+  group_by(gene_set_group, gene_set) %>%
+  summarize(genes = list(gene), .groups = "drop")
+
+progression_plots_hlae <- gene_sets_for_plotting %>%
+  cross_join(
+    progression_by_patient
+  ) %>%
+  rowwise() %>%
+  mutate(
+    plots = make_progression_plot_hlae(count_progression, gene_set, genes, progression_col = lesion_acronym) %>%
+      list()
+  ) %>%
+  ungroup() %>%
+  unnest_longer(plots, values_to = "plot", indices_to = "plot_type")
+
+dir.create("plots/progression_plots_hlae")
+pwalk(
+  progression_plots_hlae %>%
+    select(-meta, -count_progression) %>%
+    nest(data = c(plot, plot_type)),
+  function(gene_set, gene_set_group, Cell_Types, sample_type, data, ...) {
+    ggsave(
+      file.path("plots/progression_plots_hlae", paste0(gene_set_group, "_", str_replace_all(gene_set, fixed("/"), "_"), "_", sample_type, "_", Cell_Types, ".pdf")),
+      egg::ggarrange(
+        plots = data$plot,
+        ncol = 1,
+        draw = FALSE
+      ),
+      width = 10, height = 25
+    )
+  }
+)
+```
+
+
+
+brms requires clean variable names, no spaces, no special characters etc.
+
+Remove sole Fimbriae sample from cancer stroma, can't fit model with just one
+sample.
+
+```{r}
+progression_by_patient_clean <- progression_by_patient %>%
+  mutate(
+    across(
+      c(meta, count_progression), \(x) map(x, janitor::clean_names)
+    ),
+    across(
+      c(meta, count_progression),
+      \(x) pmap(
+        list(x, Cell_Types, sample_type),
+        \(m, ct, st) {
+          if (ct == "stroma" && st == "cancer") {
+            m %>%
+              filter(lesions_categories_all != "Fimbriae") %>%
+              mutate(lesions_categories_all = fct_drop(lesions_categories_all))
+          } else {
+            m
+          }
+        }
+      )
+    )
+  )
+```
+
+## Job functions
+
+```{r}
+run_model_job <- function(task_id, input_data_path, model_formula, genes, ...) {
+  library(tidyverse)
+  library(brms)
+  library(qs)
+
+  message("Reading task...", task_id)
+  input_data <- qread(input_data_path) %>%
+    filter(target_name %in% genes)
+  message("Fitting model...")
+  model <- brm(
+    as.formula(model_formula),
+    # log_scaled ~ mo(lesions_types_epithelial) + hlae_class + (1 + mo(lesions_types_epithelial) + hlae_class | scan_name + target_name),
+    # log_scaled ~ mo(lesions_types_epithelial) + (1 + mo(lesions_types_epithelial) | scan_name*target_name),
+    data = input_data,
+    prior = c(
+      set_prior("normal(0, 2)", class = "b"),
+      set_prior("normal(0, 2)", class = "Intercept")
+    ),
+    iter = 4000,
+    warmup = 1500,
+    cores = 4,
+    chains = 4,
+    seed = 42,
+    control = list(
+      # Slower sampling to avoid divergences
+      adapt_delta = 0.99
+    ),
+    ...
+  )
+  message("Done!")
+  qsave(
+    model,
+    file.path("job-outputs", paste0(task_id, ".qs"))
+  )
+}
+
+extract_model_warnings <- function(m) {
+  warn <- NULL
+  withCallingHandlers(
+    summary(m),
+    warning = function(w) {
+      warn <<- append(warn, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  if (length(warn) > 0)
+    paste(warn, collapse = "\n")
+  else
+    NA_character_
+}
+
+```
+
+## Progression models without HLA-E
+
+Model gene expression during cancer progression using a ordinal predictor
+for the lesion stage in brms.
+
+The model is a mixed effects model with random slopes and intercepts for each
+patient and each gene.
+
+Trying different variants first. Using different interaction terms and excluding/
+including the HLA-E status as a predictor.
+
+
+```{r}
+test_model_formulas <- tribble(
+  ~model_description, ~model_formula,
+  # "with_hlae_full_interaction",
+  # log_scaled ~ mo(lesions_types_epithelial) * hlae_cycif_binary +
+  #   (1 + mo(lesions_types_epithelial) * hlae_cycif_binary | scan_name * target_name),
+  # "with_hlae_partial_interaction_2",
+  # log_scaled ~ mo(lesions_types_epithelial) * hlae_cycif_binary +
+  #   (1 + mo(lesions_types_epithelial) | scan_name:target_name + scan_name) +
+  #   (0 + mo(lesions_types_epithelial) * hlae_cycif_binary | target_name),
+  # "with_hlae_full_interaction_no_cov",
+  # log_scaled ~ mo(lesions_types_epithelial) * hlae_cycif_binary +
+  #   (1 + mo(lesions_types_epithelial) * hlae_cycif_binary || scan_name * target_name),
+  # "with_hlae_full_interaction_random",
+  #  log_scaled ~ mo(lesions_types_epithelial) +
+  #    (1 + mo(lesions_types_epithelial) | scan_name * target_name + hlae_cycif_binary + hlae_cycif_binary:scan_name  + hlae_cycif_binary:target_name),
+  "with_hlae_full_interaction_random_2",
+   log_scaled ~ mo(lesions_types_epithelial) +
+     (1 + mo(lesions_types_epithelial) | scan_name * target_name + hlae_cycif_binary + hlae_cycif_binary:target_name),
+  # "with_hlae_partial_interaction",
+  #  log_scaled ~ mo(lesions_types_epithelial) * hlae_cycif_binary +
+  #    (1 + mo(lesions_types_epithelial) * hlae_cycif_binary | target_name) +
+  #    (1 + mo(lesions_types_epithelial) + hlae_cycif_binary | scan_name + scan_name:target_name),
+  # "with_interaction", log_scaled ~ mo(lesions_types_epithelial) + (1 + mo(lesions_types_epithelial) | scan_name*target_name),
+  # "without_interaction", log_scaled ~ mo(lesions_types_epithelial) + (1 + mo(lesions_types_epithelial) | scan_name + target_name),
+  # "interaction_and_target_only", log_scaled ~ mo(lesions_types_epithelial) + (1 + mo(lesions_types_epithelial) | scan_name:target_name + target_name)
+)
+```
+
+Looks like `with_hlae_full_interaction` is the best model with a lower ELPD
+than the other models.
+
+Pareto K from LOO CV shows that the model is well behaved, with just a single
+data point having a Pareto k >1. This is a data point with `SERPINB2` in the
+IRDS gene set which is a big outlier also in the progression plots. Probably
+safe to just ignore and continue as is.
+
+Doing the same for stroma ROIs. We only have three lesion types here, but
+STIL/p53 has very few samples, so we'll use a binary predictor for STIC vs
+Inv Cancer.
+
+```{r}
+dir.create("model-data")
+progression_model_spec <- progression_by_patient_clean %>%
+  mutate(
+    model_type = "ordinal",
+    predictor_var = "lesions_categories_all",
+    predictor_term = case_when(
+      model_type == "ordinal" ~ paste0("mo(", predictor_var, ")")
+    ),
+    model_formula = paste0(
+      "log_scaled ~ ", predictor_term, "+",
+      "(1 + ", predictor_term, " | scan_name * target_name)"
+    ),
+    model_spec_id = paste(model_type, predictor_var, Cell_Types, sample_type, sep = "_"),
+    input_data_path = paste0("model-data/model_input_", model_spec_id, ".qs")
+  )
+
+qsave(
+  progression_model_spec,
+  "model-data/progression_models_spec.qs"
+)
+# progression_model_spec <- qread("model-data/progression_models_spec.qs")
+
+pwalk(
+  progression_model_spec,
+  function(predictor_var, count_progression, input_data_path, ...) {
+    qsave(
+      count_progression,
+      input_data_path
+    )
+  }
+)
+
+reg <- makeRegistry()
+# reg <- loadRegistry("registry", writeable = TRUE)
+
+progression_model_input <- progression_model_spec %>%
+  select(model_spec_id, input_data_path, model_formula) %>%
+  crossing(
+    gene_sets_unique %>%
+      select(gene_set, genes)
+  ) %>%
+  mutate(
+    task_id_number = seq_len(n()),
+    task_id = paste0("progression-job-", task_id_number)
+  )
+
+dir.create("job-outputs")
+batchMap(
+  fun = run_model_job,
+  args = progression_model_input %>%
+    select(task_id, input_data_path, model_formula, genes)
+)
+
+job_table <- findJobs(reg = reg) %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+test_jobs <- withr::with_seed(
+  42,
+  progression_model_input %>%
+    group_by(model_spec_id) %>%
+    slice_sample(n = 3) %>%
+    pull(task_id) %>%
+    str_replace("progression-job-", "") %>%
+    as.integer()
+)
+
+submitJobs(
+  job_table,
+  resources = list(
+    memory = "2gb",
+    ncpus = 4L,
+    partition = "short",
+    walltime = 1*60*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
+  ),
+  reg = reg
+)
+
+progression_model_res <- progression_model_input %>%
+  filter(task_id_number %in% findDone(reg = reg)$job.id) %>%
+  mutate(
+    model = map(
+      task_id,
+      ~qread(
+        file.path("job-outputs", paste0(.x, ".qs"))
+      )
+    ),
+    warnings = map_chr(model, possibly(extract_model_warnings))
+  )
+
+progression_model_res_warnings <- progression_model_res %>%
+  mutate(
+    n_divergent = str_match(
+      warnings,
+      "There were ([0-9]+) divergent transitions after warmup"
+    )[, 2] %>%
+      as.integer() %>%
+      replace_na(0)
+  )
+
+write_csv(
+  progression_model_res_warnings %>%
+    inner_join(progression_model_spec) %>%
+    select(where(negate(is.list))),
+  "model-results/progression_model_res_warnings.csv"
+)
+
+dir.create("model-results")
+qsave(
+  progression_model_res,
+  "model-results/progression_model_res.qs"
+)
+# progression_model_res <- qread("model-results/progression_model_res.qs")
+```
+
+### Extract and process draws
+
+```{r}
+extract_post_draws <- function(m, data, genes, pred_var) {
+  message(".")
+  data <- data %>%
+    filter(target_name %in% genes) %>%
+    mutate(across({{pred_var}}, fct_drop))
+  pred_var_sym <- rlang::sym(pred_var)
+  # browser()
+  trend_by_gene <- epred_draws(
+    m,
+    newdata = data %>%
+      distinct(
+        !!pred_var_sym,
+        target_name
+      ),
+    # Don't include uncertainty from the patient-level random effects
+    re_formula = as.formula(
+      paste0("~(1 + mo(", pred_var, ") | target_name)")
+    )
+  )
+  global_trend <- epred_draws(
+    m,
+    newdata = data %>%
+      distinct(!!pred_var_sym) %>%
+      drop_na(),
+    re_formula = NA
+  )
+  pairwise_global <- emmeans(
+    m,
+    as.formula(paste0("~", pred_var)),
+    epred = TRUE,
+    re_formula = NA
+  ) %>%
+    contrast(method = "revpairwise") %>%
+    gather_emmeans_draws()
+  pairwise_by_gene <- emmeans(
+    m,
+    as.formula(paste0("~", pred_var, " | target_name")),
+    epred = TRUE,
+    re_formula = as.formula(
+      paste0("~(1 + mo(", pred_var, ") | target_name)")
+    )
+  ) %>%
+    contrast(method = "revpairwise") %>%
+    gather_emmeans_draws()
+  list(
+    global_trend = global_trend,
+    trend_by_gene = trend_by_gene,
+    pairwise_global = pairwise_global,
+    pairwise_by_gene = pairwise_by_gene
+  )
+}
+
+progression_model_post_draws <- progression_model_res %>%
+  filter(!map_lgl(model, is.null)) %>%
+  inner_join(
+    progression_model_spec
+  ) %>%
+  mutate(
+    post_draws = pmap(
+      list(
+        model,
+        count_progression,
+        genes,
+        predictor_var
+      ),
+      extract_post_draws
+    )
+  ) %>%
+  dplyr::select(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term, model_formula,
+    gene_set, task_id, post_draws
+  ) %>%
+  unnest_wider(post_draws)
+
+qsave(
+  progression_model_post_draws,
+  "model-results/progression_model_post_draws.qs"
+)
+# incidental_models_post_draws <- qread("model-results/incidental_models_post_draws.qs")
+```
+
+```{r}
+run_sexit <- function(.x, group_vars = NULL) {
+  group_syms <- rlang::syms(group_vars)
+  # browser()
+  .x %>%
+    group_by(contrast, !!!group_syms) %>%
+    summarise(
+      pd = sexit(.value, ci = .95) %>%
+        as_tibble() %>%
+        list(),
+      .groups = "drop"
+    ) %>%
+    unnest(pd) %>%
+    mutate(
+      significant = cut(
+        Significance,
+        breaks = c(-Inf, .95, .99, Inf),
+        labels = c("<95%", ">95%", ">99%"),
+        ordered_result = TRUE
+      )
+    )
+}
+
+progression_models_global_sexit <- progression_model_post_draws %>%
+  select(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term, model_formula,
+    gene_set, task_id, starts_with("pairwise")
+  ) %>%
+  mutate(
+    sexit_global = map(
+      pairwise_global,
+      run_sexit
+    ),
+    sexit_by_gene = map(
+      pairwise_by_gene,
+      ~run_sexit(.x, "target_name")
+    )
+  ) %>%
+  select(-starts_with("pairwise"))
+
+qsave(
+  progression_models_global_sexit,
+  "model-results/progression_models_global_sexit.qs"
+)
+# incidental_models_global_sexit <- qread("model-results/incidental_models_global_sexit.qs")
+```
+
+### Save to Synapse
+
+```{r}
+base_syn <- "syn52658402"
+progression_syn <- synMkdir(base_syn, "modeling", "all_progression")
+
+synStoreMany(
+  c(
+    "model-results/progression_models_global_sexit.qs",
+    "model-results/progression_model_post_draws.qs",
+    "model-results/progression_model_res.qs",
+    "model-results/progression_model_res_warnings.csv"
+  ),
+  parentId = progression_syn,
+  used = unname(syn_inputs),
+  forceVersion = FALSE,
+  executed = "https://github.com/clemenshug/pre-ovarian-cancer-atlas/blob/main/progression_models.Rmd"
+)
+```
+
+
+## Categorical models with HLA-E
+
+Don't do for stroma in cancer samples because not enough samples are HLA-E negative.
+
+```{r}
+progression_model_spec_hlae_cat <- progression_by_patient_clean %>%
+  filter(
+    !(Cell_Types == "stroma" & sample_type == "cancer")
+  ) %>%
+  mutate(
+    model_type = "categorical",
+    predictor_var = "lesions_categories_all",
+    predictor_term = case_when(
+      model_type == "ordinal" ~ paste0("mo(", predictor_var, ")"),
+      .default = predictor_var
+    ),
+    model_formula = paste0(
+      "log_scaled ~ ", predictor_term, "* hlae_cycif_binary +",
+      "(1 + ", predictor_term, " * hlae_cycif_binary | scan_name * target_name)"
+    ),
+    model_spec_id = paste("hlae_cat", model_type, predictor_var, Cell_Types, sample_type, sep = "_"),
+    input_data_path = paste0("model-data/model_input_hlae_", model_spec_id, ".qs")
+  )
+
+qsave(
+  progression_model_spec_hlae_cat,
+  "model-data/progression_model_spec_hlae_cat.qs"
+)
+# progression_model_spec_hlae_cat <- qread("model-data/progression_model_spec_hlae_cat.qs")
+
+pwalk(
+  progression_model_spec_hlae_cat,
+  function(predictor_var, count_progression, input_data_path, ...) {
+    qsave(
+      count_progression,
+      input_data_path
+    )
+  }
+)
+
+reg_cat <- makeRegistry("registry_hlae_cat")
+# reg_cat <- loadRegistry("registry_hlae_cat", writeable = TRUE)
+
+progression_model_input_hlae_cat <- progression_model_spec_hlae_cat %>%
+  select(model_spec_id, input_data_path, model_formula, predictor_term) %>%
+  crossing(
+    gene_sets_unique %>%
+      select(gene_set, genes)
+  ) %>%
+  mutate(
+    task_id = paste0("progression-job-hlae-cat-", seq_len(n()))
+  )
+
+dir.create("job-outputs")
+batchMap(
+  fun = run_model_job,
+  args = progression_model_input_hlae_cat %>%
+    select(task_id, input_data_path, model_formula, genes),
+  reg = reg_cat
+)
+
+job_table_cat <- findJobs(reg = reg_cat) %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+# test_jobs <- withr::with_seed(
+#   42,
+#   progression_model_input_hlae %>%
+#     group_by(model_spec_id) %>%
+#     slice_sample(n = 3) %>%
+#     pull(task_id) %>%
+#     str_replace("progression-job-hlae-", "") %>%
+#     as.integer()
+# )
+
+submitJobs(
+  job_table[findExpired(reg = reg_cat)],
+  resources = list(
+    memory = "2gb",
+    ncpus = 4L,
+    partition = "short",
+    walltime = 12*60*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
+  ),
+  reg = reg_cat
+)
+```
+
+
+Not really enough memory for loading all models into memory. Extracting
+post-draws on the fly.
+
+### Extract and process draws
+
+```{r}
+extract_post_draws_hlae_cat <- function(m, data, genes, pred_var, pred_term) {
+  message(".")
+  data <- data %>%
+    filter(target_name %in% genes) %>%
+    mutate(across(all_of(pred_var), fct_drop))
+  pred_var_sym <- rlang::sym(pred_var)
+  # browser()
+  trend_by_gene_by_hlae <- epred_draws(
+    m,
+    newdata = data %>%
+      distinct(
+        !!pred_var_sym,
+        target_name
+      ) %>%
+      crossing(hlae_cycif_binary = c("pos", "neg")),
+    # Don't include uncertainty from the patient-level random effects
+    re_formula = as.formula(
+      paste0("~(1 + ", pred_term, " + hlae_cycif_binary | target_name)")
+    )
+  )
+  global_trend_by_hlae <- epred_draws(
+    m,
+    newdata = data %>%
+      distinct(!!pred_var_sym, hlae_cycif_binary) %>%
+      drop_na(),
+    re_formula = NA
+  )
+  pairwise_stages_by_hlae <- emmeans(
+    m,
+    as.formula(paste0("~", pred_var, " | hlae_cycif_binary")),
+    epred = TRUE,
+    re_formula = NA
+  ) %>%
+    contrast(method = "revpairwise") %>%
+    gather_emmeans_draws()
+  pairwise_hlae_by_stage <- emmeans(
+    m,
+    as.formula(paste0("~hlae_cycif_binary | ", pred_var)),
+    epred = TRUE,
+    re_formula = NA
+  ) %>%
+    contrast(method = "revpairwise") %>%
+    gather_emmeans_draws()
+  pairwise_stages_by_hlae_by_gene <- emmeans(
+    m,
+    as.formula(paste0("~", pred_var, " + target_name | hlae_cycif_binary ")),
+    epred = TRUE,
+    re_formula = as.formula(
+      paste0("~(1 + ", pred_term, " + hlae_cycif_binary | target_name)")
+    )
+  ) %>%
+    contrast(method = "revpairwise", by = c("hlae_cycif_binary", "target_name")) %>%
+    gather_emmeans_draws()
+  pairwise_hlae_by_stage_by_gene <- emmeans(
+    m,
+    as.formula(paste0("~ hlae_cycif_binary + target_name | ", pred_var)),
+    epred = TRUE,
+    re_formula = as.formula(
+      paste0("~(1 + ", pred_term, " + hlae_cycif_binary | target_name)")
+    )
+  ) %>%
+    contrast(method = "revpairwise", by = c("target_name", pred_var)) %>%
+    gather_emmeans_draws()
+  list(
+    pairwise_stages_by_hlae = pairwise_stages_by_hlae,
+    pairwise_hlae_by_stage = pairwise_hlae_by_stage,
+    global_trend_by_hlae = global_trend_by_hlae,
+    trend_by_gene_by_hlae = trend_by_gene_by_hlae,
+    pairwise_stages_by_hlae_by_gene = pairwise_stages_by_hlae_by_gene,
+    pairwise_hlae_by_stage_by_gene = pairwise_hlae_by_stage_by_gene
+  )
+}
+
+
+process_model_hlae_cat <- function(model_path, data, genes, pred_var, pred_term) {
+  message(".")
+  m <- qread(model_path)
+  post_draws <- extract_post_draws_hlae_cat(m, data, genes, pred_var, pred_term)
+  warnings <- extract_model_warnings(model_path)
+  n_divergent <- str_match(
+    warnings,
+    "There were ([0-9]+) divergent transitions after warmup"
+  )[, 2] %>%
+    as.integer() %>%
+    replace_na(0)
+  not_converged <- str_detect(
+    warnings,
+    "Parts of the model have not converged"
+  ) %>%
+    replace_na(FALSE)
+  list(
+    warnings = warnings,
+    n_divergent = n_divergent,
+    not_converged = not_converged
+  ) %>%
+    c(post_draws)
+}
+
+progression_model_res_hlae_cat <- progression_model_input_hlae_cat[findDone(reg = reg_cat)$job.id,] %>%
+  inner_join(
+    progression_model_spec_hlae_cat
+  ) %>%
+  rowwise() %>%
+  mutate(
+    res = list(
+      process_model_hlae_cat(
+        file.path("job-outputs", paste0(task_id, ".qs")),
+        count_progression,
+        genes,
+        predictor_var,
+        predictor_term
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  dplyr::select(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term, model_formula,
+    gene_set, task_id, res
+  ) %>%
+  unnest_wider(res)
+
+qsave(
+  progression_model_res_hlae_cat,
+  "model-results/progression_model_res_hlae_cat.qs"
+)
+# progression_model_res_hlae_cat <- qread("model-results/progression_model_res_hlae_cat.qs")
+
+
+write_csv(
+  progression_model_res_hlae_cat %>%
+    select(where(negate(is.list))),
+  "model-results/progression_model_res_warnings_hlae_cat.csv"
+)
+
+```
+
+```{r}
+run_sexit <- function(.x, group_vars = NULL) {
+  group_syms <- rlang::syms(group_vars)
+  # browser()
+  .x %>%
+    group_by(contrast, !!!group_syms) %>%
+    summarise(
+      pd = sexit(.value, ci = .95) %>%
+        as_tibble() %>%
+        list(),
+      .groups = "drop"
+    ) %>%
+    unnest(pd) %>%
+    mutate(
+      significant = cut(
+        Significance,
+        breaks = c(-Inf, .95, .99, Inf),
+        labels = c("<95%", ">95%", ">99%"),
+        ordered_result = TRUE
+      )
+    )
+}
+
+progression_models_global_sexit_hlae_cat <- progression_model_res_hlae_cat %>%
+  select(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term, model_formula,
+    gene_set, task_id, starts_with("pairwise")
+  ) %>%
+  mutate(
+    sexit_stages_by_hlae = map(
+      pairwise_stages_by_hlae,
+      ~run_sexit(.x, "hlae_cycif_binary")
+    ),
+    sexit_hlae_by_stage = map(
+      pairwise_hlae_by_stage,
+      ~run_sexit(.x, "lesions_categories_all")
+    ),
+    sexit_stages_by_hlae_by_gene = map(
+      pairwise_stages_by_hlae_by_gene,
+      ~run_sexit(.x, c("hlae_cycif_binary", "target_name"))
+    ),
+    sexit_hlae_by_stage_by_gene = map(
+      pairwise_hlae_by_stage_by_gene,
+      ~run_sexit(.x, c("target_name", "lesions_categories_all"))
+    )
+  ) %>%
+  select(-starts_with("pairwise"))
+
+qsave(
+  progression_models_global_sexit_hlae_cat,
+  "model-results/progression_models_global_sexit_hlae_cat.qs"
+)
+# progression_models_global_sexit_hlae_cat <- qread("model-results/progression_models_global_sexit_hlae_cat.qs")
+```
+
+### Save to Synapse
+
+```{r}
+base_syn <- "syn52658402"
+progression_syn <- synMkdir(base_syn, "modeling", "all_progression")
+
+synStoreMany(
+  c(
+    "model-results/progression_models_global_sexit_hlae_cat.qs",
+    "model-results/progression_model_res_hlae_cat.qs",
+    "model-results/progression_model_res_warnings_hlae_cat.csv"
+  ),
+  parentId = progression_syn,
+  used = unname(syn_inputs),
+  forceVersion = FALSE,
+  executed = "https://github.com/clemenshug/pre-ovarian-cancer-atlas/blob/main/progression_models.Rmd"
+)
+
+```
+
+
+## Progression models with HLA-E
+
+Don't do for stroma in cancer samples because not enough samples are HLA-E negative.
+
+```{r}
+progression_model_spec_hlae <- progression_by_patient_clean %>%
+  filter(
+    !(Cell_Types == "stroma" & sample_type == "cancer")
+  ) %>%
+  mutate(
+    model_type = "ordinal",
+    predictor_var = "lesions_categories_all",
+    predictor_term = case_when(
+      model_type == "ordinal" ~ paste0("mo(", predictor_var, ")")
+    ),
+    model_formula = paste0(
+      "log_scaled ~ ", predictor_term, "* hlae_cycif_binary +",
+      "(1 + ", predictor_term, " * hlae_cycif_binary | scan_name * target_name)"
+    ),
+    model_spec_id = paste("hlae", model_type, predictor_var, Cell_Types, sample_type, sep = "_"),
+    input_data_path = paste0("model-data/model_input_hlae_", model_spec_id, ".qs")
+  )
+
+qsave(
+  progression_model_spec_hlae,
+  "model-data/progression_model_spec_hlae.qs"
+)
+# progression_model_spec_hlae <- qread("model-data/progression_model_spec_hlae.qs")
+
+pwalk(
+  progression_model_spec_hlae,
+  function(predictor_var, count_progression, input_data_path, ...) {
+    qsave(
+      count_progression,
+      input_data_path
+    )
+  }
+)
+
+reg <- makeRegistry("registry_hlae")
+# reg <- loadRegistry("registry_hlae", writeable = TRUE)
+
+progression_model_input_hlae <- progression_model_spec_hlae %>%
+  select(model_spec_id, input_data_path, model_formula) %>%
+  crossing(
+    gene_sets_unique %>%
+      select(gene_set, genes)
+  ) %>%
+  mutate(
+    task_id = paste0("progression-job-hlae-", seq_len(n()))
+  )
+
+dir.create("job-outputs")
+batchMap(
+  fun = run_model_job,
+  args = progression_model_input_hlae %>%
+    select(task_id, input_data_path, model_formula, genes),
+  reg = reg
+)
+
+job_table_hlae <- findJobs(reg = reg) %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+test_jobs <- withr::with_seed(
+  42,
+  progression_model_input_hlae %>%
+    group_by(model_spec_id) %>%
+    slice_sample(n = 3) %>%
+    pull(task_id) %>%
+    str_replace("progression-job-hlae-", "") %>%
+    as.integer()
+)
+
+submitJobs(
+  job_table_hlae[findExpired(reg = reg)],
+  resources = list(
+    memory = "2gb",
+    ncpus = 4L,
+    partition = "short",
+    walltime = 4*60*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
+  ),
+  reg = reg
+)
+
+progression_model_res_hlae <- progression_model_input_hlae[findDone(reg = reg)$job.id,] %>%
+  mutate(
+    model = map(
+      task_id,
+      ~possibly(qread)(
+        file.path("job-outputs", paste0(.x, ".qs"))
+      )
+    ),
+    warnings = map_chr(model, possibly(extract_model_warnings))
+  )
+
+progression_model_res_warnings_hlae <- progression_model_res_hlae %>%
+  mutate(
+    n_divergent = str_match(
+      warnings,
+      "There were ([0-9]+) divergent transitions after warmup"
+    )[, 2] %>%
+      as.integer() %>%
+      replace_na(0),
+    not_converged = str_detect(
+      warnings,
+      "Parts of the model have not converged"
+    ) %>%
+      replace_na(FALSE)
+  )
+
+write_csv(
+  progression_model_res_warnings_hlae %>%
+    inner_join(progression_model_spec_hlae) %>%
+    select(where(negate(is.list))),
+  "model-results/progression_model_res_warnings_hlae.csv"
+)
+
+dir.create("model-results")
+qsave(
+  progression_model_res_hlae,
+  "model-results/progression_model_res_hlae.qs"
+)
+# progression_model_res_hlae <- qread("model-results/progression_model_res_hlae.qs")
+```
+
+### Extract and process draws
+
+```{r}
+extract_post_draws_hlae <- function(m, data, genes, pred_var) {
+  message(".")
+  data <- data %>%
+    filter(target_name %in% genes) %>%
+    mutate(across({{pred_var}}, fct_drop))
+  pred_var_sym <- rlang::sym(pred_var)
+  # browser()
+  trend_by_gene_by_hlae <- epred_draws(
+    m,
+    newdata = data %>%
+      distinct(
+        !!pred_var_sym,
+        target_name
+      ) %>%
+      crossing(hlae_cycif_binary = c("pos", "neg")),
+    # Don't include uncertainty from the patient-level random effects
+    re_formula = as.formula(
+      paste0("~(1 + mo(", pred_var, ") + hlae_cycif_binary | target_name)")
+    )
+  )
+  global_trend_by_hlae <- epred_draws(
+    m,
+    newdata = data %>%
+      distinct(!!pred_var_sym, hlae_cycif_binary) %>%
+      drop_na(),
+    re_formula = NA
+  )
+  pairwise_stages_by_hlae <- emmeans(
+    m,
+    as.formula(paste0("~", pred_var, " | hlae_cycif_binary")),
+    epred = TRUE,
+    re_formula = NA
+  ) %>%
+    contrast(method = "revpairwise") %>%
+    gather_emmeans_draws()
+  pairwise_hlae_by_stage <- emmeans(
+    m,
+    as.formula(paste0("~hlae_cycif_binary | ", pred_var)),
+    epred = TRUE,
+    re_formula = NA
+  ) %>%
+    contrast(method = "revpairwise") %>%
+    gather_emmeans_draws()
+  pairwise_stages_by_hlae_by_gene <- emmeans(
+    m,
+    as.formula(paste0("~", pred_var, " + target_name | hlae_cycif_binary ")),
+    epred = TRUE,
+    re_formula = as.formula(
+      paste0("~(1 + mo(", pred_var, ") + hlae_cycif_binary | target_name)")
+    )
+  ) %>%
+    contrast(method = "revpairwise", by = c("hlae_cycif_binary", "target_name")) %>%
+    gather_emmeans_draws()
+  pairwise_hlae_by_stage_by_gene <- emmeans(
+    m,
+    as.formula(paste0("~ hlae_cycif_binary + target_name | ", pred_var)),
+    epred = TRUE,
+    re_formula = as.formula(
+      paste0("~(1 + mo(", pred_var, ") + hlae_cycif_binary | target_name)")
+    )
+  ) %>%
+    contrast(method = "revpairwise", by = c("target_name", pred_var)) %>%
+    gather_emmeans_draws()
+  list(
+    pairwise_stages_by_hlae = pairwise_stages_by_hlae,
+    pairwise_hlae_by_stage = pairwise_hlae_by_stage,
+    global_trend_by_hlae = global_trend_by_hlae,
+    trend_by_gene_by_hlae = trend_by_gene_by_hlae,
+    pairwise_stages_by_hlae_by_gene = pairwise_stages_by_hlae_by_gene,
+    pairwise_hlae_by_stage_by_gene = pairwise_hlae_by_stage_by_gene
+  )
+}
+
+progression_model_post_draws_hlae_raw <- progression_model_res_hlae %>%
+  filter(!map_lgl(model, is.null)) %>%
+  inner_join(
+    progression_model_spec_hlae
+  ) %>%
+  mutate(
+    post_draws = pmap(
+      list(
+        model,
+        count_progression,
+        genes,
+        predictor_var
+      ),
+      extract_post_draws_hlae
+    )
+  )
+
+qsave(
+  progression_model_post_draws_hlae_raw,
+  "model-results/progression_model_post_draws_hlae_raw.qs"
+)
+
+progression_model_post_draws_hlae <- progression_model_post_draws_hlae_raw %>%
+  dplyr::select(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term, model_formula,
+    gene_set, task_id, post_draws
+  ) %>%
+  unnest_wider(post_draws)
+
+qsave(
+  progression_model_post_draws_hlae,
+  "model-results/progression_model_post_draws_hlae.qs"
+)
+# progression_model_post_draws_hlae <- qread("model-results/progression_model_post_draws_hlae.qs")
+```
+
+```{r}
+run_sexit <- function(.x, group_vars = NULL) {
+  group_syms <- rlang::syms(group_vars)
+  # browser()
+  .x %>%
+    group_by(contrast, !!!group_syms) %>%
+    summarise(
+      pd = sexit(.value, ci = .95) %>%
+        as_tibble() %>%
+        list(),
+      .groups = "drop"
+    ) %>%
+    unnest(pd) %>%
+    mutate(
+      significant = cut(
+        Significance,
+        breaks = c(-Inf, .95, .99, Inf),
+        labels = c("<95%", ">95%", ">99%"),
+        ordered_result = TRUE
+      )
+    )
+}
+
+progression_models_global_sexit_hlae <- progression_model_post_draws_hlae %>%
+  select(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term, model_formula,
+    gene_set, task_id, starts_with("pairwise")
+  ) %>%
+  mutate(
+    sexit_stages_by_hlae = map(
+      pairwise_stages_by_hlae,
+      ~run_sexit(.x, "hlae_cycif_binary")
+    ),
+    sexit_hlae_by_stage = map(
+      pairwise_hlae_by_stage,
+      ~run_sexit(.x, "lesions_categories_all")
+    ),
+    sexit_stages_by_hlae_by_gene = map(
+      pairwise_stages_by_hlae_by_gene,
+      ~run_sexit(.x, c("hlae_cycif_binary", "target_name"))
+    ),
+    sexit_hlae_by_stage_by_gene = map(
+      pairwise_hlae_by_stage_by_gene,
+      ~run_sexit(.x, c("target_name", "lesions_categories_all"))
+    )
+  ) %>%
+  select(-starts_with("pairwise"))
+
+qsave(
+  progression_models_global_sexit_hlae,
+  "model-results/progression_models_global_sexit_hlae.qs"
+)
+# incidental_models_global_sexit <- qread("model-results/incidental_models_global_sexit.qs")
+```
+
+### Save to Synapse
+
+```{r}
+base_syn <- "syn52658402"
+progression_syn <- synMkdir(base_syn, "modeling", "all_progression")
+
+synStoreMany(
+  c(
+    "model-results/progression_models_global_sexit_hlae.qs",
+    "model-results/progression_model_post_draws_hlae.qs",
+    "model-results/progression_model_res_hlae.qs",
+    "model-results/progression_model_res_warnings_hlae.csv"
+  ),
+  parentId = progression_syn,
+  used = unname(syn_inputs),
+  forceVersion = FALSE,
+  executed = "https://github.com/clemenshug/pre-ovarian-cancer-atlas/blob/main/progression_models.Rmd"
+)
+
+```
+
+
+## Model per gene
+
+Run per-gene models
+
+### With HLA-E
+
+```{r}
+dir.create("model-data")
+progression_model_spec_by_gene_hlae <- progression_by_patient_clean %>%
+  filter(
+    !(Cell_Types == "stroma" & sample_type == "cancer")
+  ) %>%
+  mutate(
+    model_type = "ordinal",
+    predictor_var = "lesions_categories_all",
+    predictor_term = case_when(
+      model_type == "ordinal" ~ paste0("mo(", predictor_var, ")")
+    ),
+    model_formula = paste0(
+      "log_scaled ~ ", predictor_term, "* hlae_cycif_binary +",
+      "(1 + ", predictor_term, " * hlae_cycif_binary | scan_name )"
+    ),
+    model_spec_id = paste("hlae", model_type, predictor_var, Cell_Types, sample_type, sep = "_"),
+    input_data_path = paste0("model-data/model_input_by_gene_hlae_", model_spec_id, ".qs")
+  )
+
+qsave(
+  progression_model_spec_by_gene_hlae,
+  "model-data/progression_models_spec_by_gene_hlae.qs"
+)
+# progression_model_spec_by_gene_hlae <- qread("model-data/progression_models_spec_by_gene_hlae.qs")
+
+pwalk(
+  progression_model_spec_by_gene_hlae,
+  function(predictor_var, count_progression, input_data_path, ...) {
+    qsave(
+      count_progression,
+      input_data_path
+    )
+  }
+)
+
+reg <- makeRegistry("registry_by_gene_hlae")
+# reg <- loadRegistry("registry_by_gene_hlae", writeable = TRUE)
+
+progression_model_input_by_gene_hlae <- progression_model_spec_by_gene_hlae %>%
+  select(model_spec_id, input_data_path, model_formula) %>%
+  crossing(
+    gene_sets %>%
+      filter(gene %in% count_matrices$TargetName) %>%
+      distinct(gene) %>%
+      mutate(gene_set = gene, genes = gene)
+  ) %>%
+  mutate(
+    task_id = paste0("progression-job-by-gene-hlae-", seq_len(n()))
+  )
+
+qsave(
+  progression_model_input_by_gene_hlae,
+  "model-data/progression_model_input_by_gene_hlae.qs"
+)
+
+dir.create("job-outputs")
+batchMap(
+  fun = run_model_job,
+  args = progression_model_input_by_gene_hlae %>%
+    select(task_id, input_data_path, model_formula, genes),
+  # Necessary for Bayes Factors
+  more.args = list(save_all_pars = TRUE)
+)
+
+job_table <- findJobs() %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+test_jobs <- withr::with_seed(
+  42,
+  progression_model_input_by_gene_hlae %>%
+    group_by(model_spec_id) %>%
+    slice_sample(n = 3) %>%
+    pull(task_id) %>%
+    str_replace("progression-job-by-gene-hlae-", "") %>%
+    as.integer()
+)
+
+submitJobs(
+  job_table,
+  resources = list(
+    memory = "2gb",
+    ncpus = 4L,
+    partition = "short",
+    # 12 min is enough for 95% of the jobs
+    walltime = 12*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
+  )
+)
+```
+
+
+```{r}
+syn_by_gene_model_dir <- synMkdir(progression_syn, "by_gene_models_hlae")
+
+synStoreMany(
+  c(
+    "model-data/progression_model_input_by_gene_hlae.qs",
+    "model-data/progression_models_spec_by_gene_hlae.qs",
+    list.files("job-outputs", full.names = TRUE, pattern = "progression-job-by-gene-hlae-\\d+\\.qs$")
+  ),
+  parentId = syn_by_gene_model_dir,
+  forceVersion = FALSE
+)
+```
+
+### Without HLA-E
+
+
+```{r}
+dir.create("model-data")
+progression_model_spec_by_gene <- progression_by_patient_clean %>%
+  filter(
+    !(Cell_Types == "stroma" & sample_type == "cancer")
+  ) %>%
+  mutate(
+    model_type = "ordinal",
+    predictor_var = "lesions_categories_all",
+    predictor_term = case_when(
+      model_type == "ordinal" ~ paste0("mo(", predictor_var, ")")
+    ),
+    model_formula = paste0(
+      "log_scaled ~ ", predictor_term, " +",
+      "(1 + ", predictor_term, " | scan_name )"
+    ),
+    model_spec_id = paste(model_type, predictor_var, Cell_Types, sample_type, sep = "_"),
+    input_data_path = paste0("model-data/model_input_by_gene_", model_spec_id, ".qs")
+  )
+
+qsave(
+  progression_model_spec_by_gene,
+  "model-data/progression_models_spec_by_gene.qs"
+)
+# progression_model_spec_by_gene <- qread("model-data/progression_models_spec_by_gene.qs")
+
+pwalk(
+  progression_model_spec_by_gene,
+  function(predictor_var, count_progression, input_data_path, ...) {
+    qsave(
+      count_progression,
+      input_data_path
+    )
+  }
+)
+
+reg <- makeRegistry("registry_by_gene")
+# reg <- loadRegistry("registry_by_gene", writeable = TRUE)
+
+progression_model_input_by_gene <- progression_model_spec_by_gene %>%
+  select(model_spec_id, input_data_path, model_formula) %>%
+  crossing(
+    gene_sets %>%
+      filter(gene %in% count_matrices$TargetName) %>%
+      distinct(gene) %>%
+      mutate(gene_set = gene, genes = gene)
+  ) %>%
+  mutate(
+    task_id = paste0("progression-job-by-gene-", seq_len(n()))
+  )
+
+qsave(
+  progression_model_input_by_gene,
+  "model-data/progression_model_input_by_gene.qs"
+)
+
+dir.create("job-outputs")
+batchMap(
+  fun = run_model_job,
+  args = progression_model_input_by_gene %>%
+    select(task_id, input_data_path, model_formula, genes),
+  more.args = list(save_all_pars = TRUE)
+)
+
+job_table <- findJobs() %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+test_jobs <- withr::with_seed(
+  42,
+  progression_model_input_by_gene %>%
+    group_by(model_spec_id) %>%
+    slice_sample(n = 3) %>%
+    pull(task_id) %>%
+    str_replace("progression-job-by-gene-", "") %>%
+    as.integer()
+)
+
+submitJobs(
+  job_table[findExpired()],
+  resources = list(
+    memory = "2gb",
+    ncpus = 4L,
+    partition = "short",
+    # 7 min is enough for 95% of the jobs
+    walltime = 14*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
+  )
+)
+```
+
+
+```{r}
+syn_by_gene_model_dir_no_hlae <- synMkdir(progression_syn, "by_gene_models")
+
+synStoreMany(
+  c(
+    "model-data/progression_model_input_by_gene.qs",
+    "model-data/progression_models_spec_by_gene.qs",
+    list.files("job-outputs", full.names = TRUE, pattern = "progression-job-by-gene-\\d+\\.qs$")
+  ),
+  parentId = syn_by_gene_model_dir_no_hlae,
+  forceVersion = FALSE
+)
+```
+
+```{r}
+progression_model_input_by_gene_both <- progression_model_input_by_gene %>%
+  inner_join(
+    progression_model_input_by_gene_hlae,
+    by = c("gene_set", "gene"),
+    suffix = c("", "_hlae")
+  )
+
+```
+
+Not really enough memory for loading all models into memory. Extracting
+post-draws on the fly.
+
+### Extract and process draws
+
+```{r}
+extract_post_draws_hlae_by_gene <- function(m, data, genes, pred_var) {
+  # browser()
+  data <- data %>%
+    filter(target_name %in% genes) %>%
+    mutate(across(all_of(pred_var), fct_drop))
+  pred_var_sym <- rlang::sym(pred_var)
+  # browser()
+  global_trend_by_hlae <- epred_draws(
+    m,
+    newdata = data %>%
+      distinct(!!pred_var_sym, hlae_cycif_binary) %>%
+      drop_na(),
+    re_formula = NA
+  )
+  pairwise_stages_by_hlae <- emmeans(
+    m,
+    as.formula(paste0("~", pred_var, " | hlae_cycif_binary")),
+    epred = TRUE,
+    re_formula = NA
+  ) %>%
+    contrast(method = "revpairwise") %>%
+    gather_emmeans_draws()
+  pairwise_hlae_by_stage <- emmeans(
+    m,
+    as.formula(paste0("~hlae_cycif_binary | ", pred_var)),
+    epred = TRUE,
+    re_formula = NA
+  ) %>%
+    contrast(method = "revpairwise") %>%
+    gather_emmeans_draws()
+  list(
+    pairwise_stages_by_hlae = pairwise_stages_by_hlae,
+    pairwise_hlae_by_stage = pairwise_hlae_by_stage,
+    global_trend_by_hlae = global_trend_by_hlae
+  )
+}
+
+process_model <- function(model_path, data, genes, pred_var) {
+  message(".")
+  m <- qread(model_path)
+  post_draws <- extract_post_draws_hlae_by_gene(m, data, genes, pred_var)
+  warnings <- extract_model_warnings(model_path)
+  n_divergent <- str_match(
+    warnings,
+    "There were ([0-9]+) divergent transitions after warmup"
+  )[, 2] %>%
+    as.integer() %>%
+    replace_na(0)
+  not_converged <- str_detect(
+    warnings,
+    "Parts of the model have not converged"
+  ) %>%
+    replace_na(FALSE)
+  list(
+    warnings = warnings,
+    n_divergent = n_divergent,
+    not_converged = not_converged
+  ) %>%
+    c(post_draws)
+}
+
+progression_model_res_by_gene_hlae <- progression_model_input_by_gene_hlae[1,] %>%
+  inner_join(
+    progression_model_spec_by_gene_hlae
+  ) %>%
+  rowwise() %>%
+  mutate(
+    res = list(
+      process_model(
+        file.path("job-outputs", paste0(task_id, ".qs")),
+        count_progression,
+        genes,
+        predictor_var
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  dplyr::select(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term, model_formula,
+    gene, gene_set, task_id, res
+  ) %>%
+  unnest_wider(res)
+
+qsave(
+  progression_model_res_by_gene_hlae,
+  "model-results/progression_model_res_by_gene_hlae.qs"
+)
+# progression_model_res_by_gene_hlae <- qread("model-results/progression_model_res_by_gene_hlae.qs")
+
+
+write_csv(
+  progression_model_res_by_gene_hlae %>%
+    select(where(negate(is.list))),
+  "model-results/progression_model_res_warnings_by_gene_hlae.csv"
+)
+
+```
+
+```{r}
+run_sexit <- function(.x, group_vars = NULL) {
+  group_syms <- rlang::syms(group_vars)
+  # browser()
+  .x %>%
+    group_by(contrast, !!!group_syms) %>%
+    summarise(
+      pd = sexit(.value, ci = .95) %>%
+        as_tibble() %>%
+        list(),
+      .groups = "drop"
+    ) %>%
+    unnest(pd) %>%
+    mutate(
+      significant = cut(
+        Significance,
+        breaks = c(-Inf, .95, .99, Inf),
+        labels = c("<95%", ">95%", ">99%"),
+        ordered_result = TRUE
+      )
+    )
+}
+
+progression_models_sexit_by_gene_hlae <- progression_model_res_by_gene_hlae %>%
+  select(
+    Cell_Types, sample_type, predictor_var, model_type, predictor_term, model_formula,
+    gene, gene_set, task_id, starts_with("pairwise")
+  ) %>%
+  mutate(
+    sexit_stages_by_hlae = map(
+      pairwise_stages_by_hlae,
+      ~run_sexit(.x, "hlae_cycif_binary")
+    ),
+    sexit_hlae_by_stage = map(
+      pairwise_hlae_by_stage,
+      ~run_sexit(.x, "lesions_categories_all")
+    )
+  ) %>%
+  select(-starts_with("pairwise"))
+
+qsave(
+  progression_models_sexit_by_gene_hlae,
+  "model-results/progression_models_sexit_by_gene_hlae.qs"
+)
+# progression_models_sexit_by_gene_hlae <- qread("model-results/progression_models_sexit_by_gene_hlae.qs")
+```
+
+### Save to Synapse
+
+```{r}
+synStoreMany(
+  c(
+    "model-results/progression_models_sexit_by_gene_hlae.qs",
+    "model-results/progression_model_res_by_gene_hlae.qs",
+    "model-results/progression_model_res_warnings_by_gene_hlae.csv"
+  ),
+  parentId = progression_syn,
+  used = unname(syn_inputs),
+  executed = "https://github.com/clemenshug/pre-ovarian-cancer-atlas/blob/main/progression_models.Rmd"
+)
+
+```

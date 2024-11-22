@@ -1,0 +1,354 @@
+---
+title: "Preprocess GeoMX data"
+author: "Clemens Hug"
+date: "2023-10-12"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(readxl)
+library(here)
+library(qs)
+
+theme_set(theme_minimal())
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data", cache = TRUE)
+```
+
+## Load counts
+
+```{r load_counts}
+read_count_matrix_excel <- function(path) {
+  read_excel(path, "TargetCountMatrix") %>%
+    # PanCK sometimes lowercase, make it all uppercase
+    rename_with(\(x) str_replace(x, "ck", "CK")) %>%
+    arrange(TargetName)
+}
+
+count_matrix <- read_count_matrix_excel(
+  here("All_batch_combined", "Q3 norm_all_batch.xlsx")
+)
+
+sample_qc_metrics <- read_excel(
+  here("All_batch_combined", "Q3 norm_all_batch.xlsx"),
+  "SegmentProperties"
+) %>%
+  mutate(
+    sample_id = str_replace(SegmentDisplayName, "ck", "CK")
+  )
+```
+
+## Metadata
+
+Remove any Immune control samples. Not needed here
+
+```{r metadata}
+load_metadata <- function(path) {
+  read_excel(path) %>%
+    mutate(
+      sample_id = paste(`Scan name`, `ROI (label)`, `Segment (Name/ Label)`, sep = " | "),
+      across(
+        c(sample_id, `Segment (Name/ Label)`),
+        ~str_replace(.x, "ck", "CK")
+      )
+    )
+}
+
+meta <- load_metadata(
+  here("All_batch_combined", "ROI_annotation_combined_all_batch_F.xlsx")
+) %>%
+  filter(
+    !str_detect(Lesions_categories_All, fixed("control", ignore_case = TRUE)),
+    !str_detect(Cell_Types_control, fixed("control", ignore_case = TRUE)),
+    Cell_Types_control != "Tnecosis"
+  ) %>%
+  mutate(
+    sample_type = case_when(
+      `Incidental? Y/N` == "Y" ~ "incidental",
+      `Incidental? Y/N` == "N" ~ "cancer",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+Check sample overlap. Verified that missing samples in count matrix were
+removed during QC. Also verified that missing samples in metadata are
+due to removal of immune control and necrosis samples.
+
+LSP16163 is present in count matrix but not in metadata. This sample passed QC
+but was excluded because, according to Tanjina:
+> I have to take that sample off because we are not including that sample on cycif.
+> That sample only had FT and Fimbriae on geomx slide too (tissue loss). So, you
+> may find that sample still exist in count matrix but not in my annotation file.
+> Count matrix file basically after normalising all the samples, so its included.
+> for my other pathway analysis and Differential gene expression, I am not
+> including that sample. So, your segment number should ideally be the same as
+> mine
+
+```{r}
+meta %>%
+  filter(!sample_id %in% colnames(count_matrix)) %>%
+  View()
+
+setdiff(colnames(count_matrix), meta$sample_id)
+
+meta %>%
+  filter(`Scan name` == "LSP16145_Scan1") %>%
+  View()
+
+meta_selected <- meta %>%
+  filter(sample_id %in% colnames(count_matrix))
+
+dir.create("data_processed")
+write_csv(
+  meta_selected,
+  "data_processed/meta_selected.csv"
+)
+```
+
+## Assemble datasets
+
+Count matrix contains both cancer samples from first GeoMX run as well as
+incidental samples from second GeoMX run. We want to separate these two for some
+analyses and normalize them separately. For other analyses we want a combined
+dataset. Creating both separate and combined datasets here.
+
+```{r assemble_data}
+count_matrices <- meta_selected %>%
+  group_by(sample_type) %>%
+  summarize(
+    data = list(select(count_matrix, TargetName, any_of(sample_id))),
+    .groups = "drop"
+  ) %>%
+  bind_rows(
+    summarize(
+      .,
+      across(sample_type, \(x) paste(x, collapse = "+")),
+      across(data, \(x) list(reduce(x, \(y, z) left_join(y, z, by = "TargetName")))),
+      .groups = "drop"
+    )
+  ) %>%
+  mutate(
+    data_mat = map(data, column_to_rownames, "TargetName") %>% map(as.matrix)
+  )
+
+dir.create("data_processed")
+qsave(
+  count_matrices,
+  "data_processed/count_matrices.qs"
+)
+```
+
+## Library size correction
+
+Don't do library size correction anymore because we are starting with Q3
+normalized data from GeoMX.
+
+Also storing log-transformed and scaled (0 mean, 1 SD) versions of the
+count matrices.
+
+```{r}
+count_matrices_trans <- count_matrices %>%
+  select(sample_type, data_mat) %>%
+  crossing(transform = c("raw", "log")) %>%
+  mutate(
+    data_mat = map2(
+      data_mat, transform,
+      \(x, y) {
+        if (y == "raw") {
+          x
+        } else {
+          log10(x)
+        }
+      }
+    )
+  ) %>%
+  crossing(scaled = c("unscaled", "scaled")) %>%
+  mutate(
+    data_mat = map2(
+      data_mat, scaled,
+      \(x, y) {
+        if (y == "unscaled") {
+          x
+        } else {
+          t(scale(t(x), center = TRUE, scale = TRUE))
+        }
+      }
+    )
+  )
+
+count_matrices_trans$data_mat[[8]] %>%
+  as_tibble(rownames = "TargetName") %>%
+  pivot_longer(
+    -TargetName,
+    names_to = "sample_id",
+    values_to = "count"
+  ) %>%
+  filter(is.na(count))
+
+count_matrices_trans_long <- count_matrices_trans %>%
+  mutate(
+    data = map(
+      data_mat,
+      \(x) as_tibble(x, rownames = "TargetName") %>%
+        pivot_longer(
+          -TargetName,
+           names_to = "sample_id",
+          values_to = "count"
+        )
+    )
+  ) %>%
+  select(-data_mat) %>%
+  unnest(data) %>%
+  pivot_wider(
+    names_from = c(transform, scaled),
+    values_from = count
+  )
+
+write_csv(
+  count_matrices_trans_long,
+  "data_processed/count_matrix_all_trans.csv.gz"
+)
+qsave(
+  count_matrices_trans,
+  "data_processed/count_matrix_all_trans.qs"
+)
+# count_matrices_trans <- qread("data_processed/count_matrix_all_trans.qs")
+```
+
+## Gene sets
+
+We selected gene sets from the literature that are associated with different
+aspects of cancer progression and immunity. We want to check if their expression
+changes during cancer progression.
+
+Gene sets are grouped by relatedness.
+
+```{r load_gene_sets}
+gene_set_file <- here("All_batch_combined", "Gene_signatures_F_08222023_short.xlsx")
+
+gene_sets <- map(
+  excel_sheets(gene_set_file) %>%
+    # Remove sheet with references
+    setdiff(c("references")) %>%
+    set_names(),
+  ~read_excel(gene_set_file, .x) %>%
+    pivot_longer(everything(), names_to = "gene_set", values_to = "gene") %>%
+    drop_na() %>%
+    mutate(
+      gene_unique = paste(gene, gene_set, sep = "_")
+    )
+) %>%
+  bind_rows(.id = "gene_set_group")
+
+gene_sets %>%
+  dplyr::count(gene) %>%
+  arrange(desc(n))
+
+write_csv(
+  gene_sets,
+  "data_processed/gene_sets.csv"
+)
+```
+
+```{r}
+setdiff(gene_sets$gene, count_matrix$TargetName)
+```
+
+14 genes in gene sets not in count matrix. Filtered out during QC
+
+```{r}
+gene_sets_selected <- gene_sets %>%
+  filter(
+    gene %in% count_matrix$TargetName
+  )
+
+gene_sets_unique <- gene_sets_selected %>%
+  group_by(gene_set) %>%
+  arrange(gene) %>%
+  summarize(
+    gene_str = paste(gene, collapse = "|"),
+    genes = list(gene),
+    .groups = "drop"
+  ) %>%
+  # Keep only one unique gene set. If multiple gene sets have the same genes,
+  # keep only one
+  group_by(gene_str) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+qsave(
+  gene_sets_unique,
+  "data_processed/gene_sets_unique.qs"
+)
+```
+
+## Check gene expression
+
+```{r}
+expression_plot_data <- count_matrices_trans_long %>%
+  inner_join(
+    gene_sets_selected %>%
+      distinct(gene),
+    by = c("TargetName" = "gene")
+  )
+
+expression_plot_data %>%
+  group_by(TargetName) %>%
+  summarize(
+    q3 = quantile(raw_unscaled, probs = .75),
+    .groups = "drop"
+  ) %>%
+  arrange(q3)
+# MIN_COUNT <- min(expression_plot_data$raw_unscaled[expression_plot_data$raw_unscaled > 0]) * .5
+
+p <- expression_plot_data %>%
+  mutate(
+    TargetName = factor(TargetName, levels = {group_by(., TargetName) %>%
+      summarize(across(raw_unscaled, mean)) %>%
+      arrange(raw_unscaled) %>%
+      pull(TargetName)})
+  ) %>%
+  filter(TargetName %in% head(levels(TargetName), n = 50)) %>%
+  ggplot(
+    aes(TargetName, raw_unscaled)
+  ) +
+  geom_violin() +
+  scale_y_log10(breaks = c(c(1, 2, 5, 10, 20, 50, 100))) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+  )
+
+```
+
+## QC metrics
+
+```{r}
+write_csv(
+  sample_qc_metrics,
+  "data_processed/qc_metrics.csv.gz"
+)
+```
+
+
+## Store in Synapse
+
+```{r upload_synapse}
+synExtra::synStoreMany(
+  c(
+    "data_processed/count_matrices.qs",
+    "data_processed/gene_sets.csv",
+    "data_processed/gene_sets_unique.qs",
+    "data_processed/meta_selected.csv",
+    "data_processed/count_matrix_all_trans.csv.gz",
+    "data_processed/count_matrix_all_trans.qs",
+    "data_processed/qc_metrics.csv.gz"
+  ),
+  parentId = "syn52658424",
+  used = "https://www.dropbox.com/sh/9qj3elozuupzemo/AADs33pqqzUFHgttpf_7RyEYa?dl=0",
+  executed = "https://github.com/clemenshug/pre-ovarian-cancer-atlas/blob/main/preprocess_data.Rmd",
+  forceVersion = FALSE
+)
+```

@@ -1,0 +1,789 @@
+---
+title: "Tumor progression model test"
+author: "Clemens Hug"
+date: "2024-01-29"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(qs)
+library(brms)
+library(tidybayes)
+library(emmeans)
+library(bayestestR)
+library(synExtra)
+library(data.table)
+library(powerjoin)
+library(batchtools)
+
+theme_set(theme_minimal(base_family = "Helvetica"))
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+syn_inputs <- c(
+  gene_sets = "syn52658610",
+  meta = "syn52658612",
+  count_matrices = "syn52658861",
+  gene_sets_unique = "syn52658611"
+)
+
+syn_files <- syn_inputs %>%
+  map(syn)
+
+gene_sets <- read_csv(syn_files[["gene_sets"]])
+
+gene_sets_unique <- qread(syn_files[["gene_sets_unique"]])
+
+meta <- read_csv(syn_files[["meta"]])
+
+count_matrices <- syn_files[["count_matrices"]] %>%
+  fread() %>%
+  as_tibble()
+```
+
+## Progression by patient
+
+```{r}
+lesion_acronyms <- c(
+  "FT" = "FT",
+  "Fimbriae" = "Fim",
+  "p53 signature" = "p53",
+  "STIL" = "STIL",
+  "STIC" = "STIC",
+  "Inv Cancer" = "Tumor"
+)
+
+meta_processed <- meta %>%
+  mutate(
+    lesion_acronym = str_replace_all(
+      Lesions_categories_All, coll(lesion_acronyms)
+    )
+  )
+
+incidental_progression <- c(
+  "FT",
+  "Fimbriae",
+  "p53 signature",
+  "STIC"
+)
+
+cancer_progression <- c(
+  "FT",
+  "Fimbriae",
+  "p53 signature",
+  "STIC",
+  "Inv Cancer"
+)
+
+progression_by_patient <- meta_processed %>%
+  mutate(
+    hlae_cycif_binary = recode(
+      `Lesions_Types_HLA-E status`,
+      low = "pos",
+      high = "pos"
+    ) %>%
+      factor(levels = c("neg", "pos")),
+  ) %>%
+  filter(
+    case_when(
+      sample_type == "incidental" ~ Lesions_categories_All %in% incidental_progression,
+      sample_type == "cancer" ~ Lesions_categories_All %in% cancer_progression,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  group_nest(Cell_Types, sample_type, .key = "meta") %>%
+  mutate(
+    meta = map2(
+      meta, sample_type,
+      \(m, st) {
+        mutate(
+          m,
+          Lesions_categories_All = ordered(
+            Lesions_categories_All,
+            levels = if (st == "incidental") incidental_progression else cancer_progression
+          ),
+          lesion_acronym = ordered(
+            lesion_acronym,
+            levels = lesion_acronyms[if (st == "incidental") incidental_progression else cancer_progression]
+          )
+        )
+      }
+    ),
+    count_progression = map2(
+      meta, sample_type,
+      \(m, st) {
+        power_inner_join(
+          m,
+          count_matrices %>%
+            filter(sample_type == st) %>%
+            select(-sample_type) %>%
+            group_by(TargetName) %>%
+            mutate(
+              across(
+                c(log_scaled, raw_scaled),
+                \(x) scale(x, center = TRUE, scale = TRUE)[, 1]
+              )
+            ) %>%
+            ungroup(),
+          by = "sample_id",
+          check = check_specs(
+            duplicate_keys_left = "warn",
+            unmatched_keys_left = "warn"
+          )
+        )
+      }
+    )
+  )
+```
+
+brms requires clean variable names, no spaces, no special characters etc.
+
+Remove sole Fimbriae sample from cancer stroma, can't fit model with just one
+sample.
+
+```{r}
+progression_by_patient_clean <- progression_by_patient %>%
+  mutate(
+    across(
+      c(meta, count_progression), \(x) map(x, janitor::clean_names)
+    ),
+    across(
+      c(meta, count_progression),
+      \(x) pmap(
+        list(x, Cell_Types, sample_type),
+        \(m, ct, st) {
+          if (ct == "stroma" && st == "cancer") {
+            m %>%
+              filter(lesions_categories_all != "Fimbriae") %>%
+              mutate(lesions_categories_all = fct_drop(lesions_categories_all))
+          } else {
+            m
+          }
+        }
+      )
+    )
+  )
+```
+
+```{r}
+run_model_job <- function(task_id, input_data_path, model_formula, genes, ...) {
+  library(tidyverse)
+  library(brms)
+  library(qs)
+
+  message("Reading task...", task_id)
+  input_data <- qread(input_data_path) %>%
+    filter(target_name %in% genes)
+  message("Fitting model...")
+  model <- brm(
+    as.formula(model_formula),
+    # log_scaled ~ mo(lesions_types_epithelial) + hlae_class + (1 + mo(lesions_types_epithelial) + hlae_class | scan_name + target_name),
+    # log_scaled ~ mo(lesions_types_epithelial) + (1 + mo(lesions_types_epithelial) | scan_name*target_name),
+    data = input_data,
+    prior = c(
+      set_prior("normal(0, 2)", class = "b"),
+      set_prior("normal(0, 2)", class = "Intercept")
+    ),
+    iter = 4000,
+    warmup = 1500,
+    cores = 4,
+    chains = 4,
+    seed = 42,
+    control = list(
+      # Slower sampling to avoid divergences
+      adapt_delta = 0.99
+    ),
+    ...
+  )
+  message("Done!")
+  qsave(
+    model,
+    file.path("job-outputs", paste0(task_id, ".qs"))
+  )
+}
+
+extract_model_warnings <- function(m) {
+  warn <- NULL
+  withCallingHandlers(
+    summary(m),
+    warning = function(w) {
+      warn <<- append(warn, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  if (length(warn) > 0)
+    paste(warn, collapse = "\n")
+  else
+    NA_character_
+}
+
+```
+
+## Cross-validation different models
+
+```{r}
+test_model_formulas <- tribble(
+  ~model_formula_name, ~model_formula,
+  "categorical_with_hlae_fixed_full_interaction",
+  log_scaled ~ lesions_categories_all * hlae_cycif_binary +
+    (1 + lesions_categories_all * hlae_cycif_binary | scan_name * target_name),
+  "with_hlae_fixed_full_interaction",
+  log_scaled ~ mo(lesions_categories_all) * hlae_cycif_binary +
+    (1 + mo(lesions_categories_all) * hlae_cycif_binary | scan_name * target_name),
+  "with_hlae_fixed_partial_interaction_2",
+  log_scaled ~ mo(lesions_categories_all) * hlae_cycif_binary +
+    (1 + mo(lesions_categories_all) | scan_name:target_name + scan_name) +
+    (0 + mo(lesions_categories_all) * hlae_cycif_binary | target_name),
+  "with_hlae_random_full_interaction",
+   log_scaled ~ mo(lesions_categories_all) +
+     (1 + mo(lesions_categories_all) | scan_name * target_name * hlae_cycif_binary),
+  "with_hlae_random_partial_interaction",
+   log_scaled ~ mo(lesions_categories_all) +
+     (1 + mo(lesions_categories_all) | scan_name * target_name + hlae_cycif_binary + hlae_cycif_binary:scan_name  + hlae_cycif_binary:target_name),
+  # "with_hlae_random_partial_interaction_2",
+  #  log_scaled ~ mo(lesions_types_epithelial) +
+  #    (1 + mo(lesions_types_epithelial) | scan_name * target_name + hlae_cycif_binary + hlae_cycif_binary:target_name),
+  # "with_hlae_partial_interaction",
+  #  log_scaled ~ mo(lesions_types_epithelial) * hlae_cycif_binary +
+  #    (1 + mo(lesions_types_epithelial) * hlae_cycif_binary | target_name) +
+  #    (1 + mo(lesions_types_epithelial) + hlae_cycif_binary | scan_name + scan_name:target_name),
+  # "with_interaction", log_scaled ~ mo(lesions_types_epithelial) + (1 + mo(lesions_types_epithelial) | scan_name*target_name),
+  # "without_interaction", log_scaled ~ mo(lesions_types_epithelial) + (1 + mo(lesions_types_epithelial) | scan_name + target_name),
+  # "interaction_and_target_only", log_scaled ~ mo(lesions_types_epithelial) + (1 + mo(lesions_types_epithelial) | scan_name:target_name + target_name)
+)
+
+test_gene_sets <- c(
+  "HLA", "MHC-I", "IRDS", "CAFs", "IFN-γ response", "Proliferation"
+)
+```
+
+Don't fit on stroma cancer, not enough HLA-E negative samples
+
+
+```{r}
+dir.create("model-data")
+progression_test_model_inputs <- progression_by_patient_clean %>%
+  filter(
+    !(Cell_Types == "stroma" & sample_type == "cancer")
+  ) %>%
+  mutate(
+    input_data_id = paste(Cell_Types, sample_type, sep = "_"),
+    input_data_path = paste0("model-data/model_input_test_", input_data_id, ".qs")
+  )
+
+pwalk(
+  progression_test_model_inputs,
+  function(count_progression, input_data_path, ...) {
+    qsave(
+      count_progression,
+      input_data_path
+    )
+  }
+)
+
+# progression_test_model_spec_2 <- progression_test_model_inputs %>%
+#   select(-c(meta)) %>%
+#   cross_join(
+#     test_model_formulas
+#   ) %>%
+#   cross_join(
+#     gene_sets_unique %>%
+#       filter(gene_set %in% test_gene_sets) %>%
+#       select(gene_set, genes)
+#   ) %>%
+#   mutate(
+#     count_progression = map2(count_progression, genes, \(x, y) {
+#       x %>%
+#         filter(target_name %in% y)
+#     }),
+#     predictor_var = "lesions_categories_all",
+#     task_id = paste("test_models", gene_set, model_formula_name, predictor_var, Cell_Types, sample_type, sep = "_")
+#   )
+
+# x <- lme4::lmer(
+#   log_scaled ~ lesions_categories_all * hlae_cycif_binary +
+#     (1 + lesions_categories_all * hlae_cycif_binary | scan_name) +
+#     (1 + lesions_categories_all * hlae_cycif_binary | scan_name:target_name) +
+#     (1 + lesions_categories_all * hlae_cycif_binary | target_name),
+#   data = progression_test_model_spec_2$count_progression[[1]],
+#   verbose = 1
+# )
+
+progression_test_model_spec <- progression_test_model_inputs %>%
+  select(-c(meta, count_progression)) %>%
+  cross_join(
+    test_model_formulas
+  ) %>%
+  cross_join(
+    gene_sets_unique %>%
+      filter(gene_set %in% test_gene_sets) %>%
+      select(gene_set, genes)
+  ) %>%
+  mutate(
+    predictor_var = "lesions_categories_all",
+    task_id = paste("test_models", gene_set, model_formula_name, predictor_var, Cell_Types, sample_type, sep = "_")
+  )
+
+qsave(
+  progression_test_model_spec,
+  "model-data/progression_test_models_spec.qs"
+)
+# progression_test_model_spec <- qread("model-data/progression_test_models_spec.qs")
+
+reg <- makeRegistry("registry_test")
+# reg <- loadRegistry("registry_test", writeable = TRUE)
+
+dir.create("job-outputs")
+batchMap(
+  fun = run_model_job,
+  args = progression_test_model_spec %>%
+    select(task_id, input_data_path, model_formula, genes),
+  more.args = list(
+    save_pars = save_pars(
+      all = TRUE
+    )
+  )
+)
+
+# run_model_job(
+#   progression_test_model_spec$task_id[[7]],
+#   progression_test_model_spec$input_data_path[[7]],
+#   progression_test_model_spec$model_formula[[7]],
+#   progression_test_model_spec$genes[[7]],
+#   save_pars = save_pars(
+#     all = TRUE
+#   )
+# )
+
+job_table <- findJobs() %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+test_jobs <- withr::with_seed(
+  42,
+  progression_test_model_spec %>%
+    mutate(task_no = seq_len(n())) %>%
+    group_by(input_data_id) %>%
+    slice_sample(n = 3) %>%
+    pull(task_no)
+)
+
+submitJobs(
+  job_table[findExpired()],
+  resources = list(
+    memory = "2gb",
+    ncpus = 4L,
+    partition = "short",
+    walltime = 12*60*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
+  )
+)
+
+progression_test_model_res <- progression_test_model_spec[findDone()$job.id,] %>%
+  mutate(
+    model = map(
+      task_id,
+      ~qread(
+        file.path("job-outputs", paste0(.x, ".qs"))
+      )
+    ),
+    warnings = map_chr(model, possibly(extract_model_warnings))
+  )
+
+progression_test_model_warnings <- progression_test_model_res %>%
+  mutate(
+    n_divergent = str_match(
+      warnings,
+      "There were ([0-9]+) divergent transitions after warmup"
+    )[, 2] %>%
+      as.integer() %>%
+      replace_na(0),
+    not_converged = str_detect(
+      warnings,
+      "not converged"
+    ) %>%
+      replace_na(FALSE)
+  )
+
+write_csv(
+  progression_test_model_warnings %>%
+    select(where(negate(is.list))),
+  "model-results/progression_test_model_warnings.csv"
+)
+# progression_test_model_warnings <- read_csv("model-results/progression_test_model_warnings.csv")
+
+dir.create("model-results")
+qsave(
+  progression_test_model_res,
+  "model-results/progression_test_model_res.qs"
+)
+# progression_test_model_res <- qread("model-results/progression_test_model_res.qs")
+```
+
+```{r}
+loo_reg <- makeRegistry("loo_registry")
+# loo_reg <- loadRegistry("loo_registry", writeable = TRUE)
+
+run_loo <- function(task_id) {
+  library(tidyverse)
+  library(brms)
+  library(qs)
+
+  message("Reading task...", task_id)
+  model <- qread(
+    file.path("job-outputs", paste0(task_id, ".qs"))
+  )
+  message("Running LOO...")
+  model_loo <- add_criterion(
+    model,
+    criterion = c("waic", "loo"),
+    moment_match = TRUE,
+    moment_match_args = list(
+      recompile = TRUE
+    )
+  )
+  message("Done!")
+  qsave(
+    model_loo,
+    file.path("job-outputs", paste0(task_id, "_loo.qs"))
+  )
+}
+
+batchMap(
+  fun = run_loo,
+  args = progression_test_model_spec %>%
+    select(task_id),
+  reg = loo_reg
+)
+
+loo_job_table <- findJobs(reg = loo_reg) %>%
+  mutate(chunk = 1)
+
+
+submitJobs(
+  loo_job_table[findNotDone()],
+  # loo_job_table[1],
+  reg = loo_reg,
+  resources = list(
+    memory = "48gb",
+    ncpus = 1L,
+    partition = "short",
+    walltime = 2*60*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
+  )
+)
+
+```
+
+
+```{r}
+progression_test_model_loo_res <- progression_test_model_spec[findDone(reg = loo_reg)$job.id,] %>%
+  mutate(
+    model_loo = map(
+      task_id,
+      ~qread(
+        file.path("job-outputs", paste0(.x, "_loo.qs"))
+      )
+    )
+  )
+
+qsave(
+  progression_test_model_loo_res,
+  "model-results/progression_test_model_loo_res.qs"
+)
+
+loo_compare2 <- function(models, ...) {
+  # browser()
+  rlang::exec(
+    loo_compare,
+    !!!models,
+    ...
+  )
+}
+
+test_model_loo_compare <- progression_test_model_loo_res %>%
+  group_by(
+    Cell_Types, sample_type, gene_set
+  ) %>%
+  summarize(
+    model_loos = list(
+      brms:::compute_loolist(
+        set_names(model_loo, model_formula_name),
+        criterion = "loo",
+        model_names = model_formula_name
+      )
+    ),
+    # model_comparison = do.call(
+    #   loo_compare,
+    #   c(
+    #     model_loo,
+    #     list(
+    #       criterion = "loo",
+    #       model_names = model_formula_name
+    #     )
+    #   ),
+    #   quote = TRUE
+    # ) %>%
+    #   list(),
+    .groups = "drop"
+  )
+
+test_model_comparison <- test_model_loo_compare %>%
+  mutate(
+    comparison = map(
+      model_loos,
+      \(x) as_tibble(x$diffs, rownames = "model_formula_name")
+    )
+  )
+
+qsave(
+  test_model_comparison %>%
+    select(-model_loos),
+  "model-results/test_model_comparison.qs"
+)
+# test_model_comparison <- qread("model-results/test_model_comparison.qs")
+
+```
+
+### Save to Synapse
+
+```{r}
+base_syn <- "syn52658402"
+test_model_syn <- synMkdir(base_syn, "modeling", "all_progression", "test_models")
+
+synStoreMany(
+  c(
+    "model-results/progression_test_model_res.qs",
+    "model-results/test_model_comparison.qs",
+    "model-results/progression_test_model_loo_res.qs"
+  ),
+  parentId = test_model_syn,
+  used = unname(syn_inputs),
+  forceVersion = FALSE,
+  executed = "https://github.com/clemenshug/pre-ovarian-cancer-atlas/blob/main/progression_models.Rmd"
+)
+
+
+```
+
+```{r}
+test_model_comparison_long <- test_model_comparison %>%
+  mutate(
+    cell_type_sample_type = paste(Cell_Types, sample_type, sep = "_")
+  ) %>%
+  select(Cell_Types, sample_type, cell_type_sample_type, gene_set, comparison) %>%
+  unnest(comparison)
+
+
+library(seriation)
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+
+test_model_comparison_clustered <- test_model_comparison_long %>%
+  mutate(
+    across(elpd_diff, as.numeric)
+  )  %>%
+  left_join(
+    progression_test_model_warnings %>%
+      select(Cell_Types, sample_type, gene_set, model_formula_name, n_divergent, not_converged),
+    by = c(
+      "Cell_Types", "sample_type", "gene_set", "model_formula_name"
+    )
+  )  %>%
+  mutate(
+    warning_text = paste(
+      n_divergent,
+      if_else(not_converged, "not converged", ""),
+      signif(elpd_diff, 2),
+      sep = " "
+    )
+  ) %>%
+  group_nest(gene_set) %>%
+  mutate(
+    data = map(
+      data,
+      \(x) cluster_df(x, model_formula_name, cell_type_sample_type, elpd_diff) %>%
+        mutate(
+          # Order such that the best model is on top
+          model_formula_name = if (
+            group_by(., model_formula_name) %>%
+              summarize(mean_elpd_diff = mean(elpd_diff), .groups = "drop") %>%
+              arrange(model_formula_name) %>% {
+                .$mean_elpd_diff[1] > .$mean_elpd_diff[nrow(.)]
+              }
+          ) fct_rev(model_formula_name)
+          else model_formula_name
+        )
+    )
+  )
+
+ps <- test_model_comparison_clustered %>%
+  mutate(
+    p = map2(
+      data, gene_set,
+      \(x, gs) ggplot(
+        x,
+        aes(
+          x = cell_type_sample_type,
+          y = model_formula_name,
+          fill = elpd_diff
+        )
+      ) +
+        geom_raster() +
+        geom_text(
+          aes(label = warning_text),
+          size = 2,
+          color = "black"
+        ) +
+        scale_fill_viridis_c() +
+        labs(title = gs)
+    )
+  )
+
+
+
+p <- patchwork::wrap_plots(
+  ps$p, ncol = 1
+)
+
+ggsave(
+  "plots/progression_test_model_comparison_clustered.pdf",
+  p,
+  width = 8,
+  height = 12,
+  dev = Cairo::CairoPDF
+)
+
+```
+
+### Test auto-regressive model
+
+```{r}
+proression_test_tasks_ar <- progression_test_model_inputs %>%
+  select(-c(meta, count_progression)) %>%
+  cross_join(
+    gene_sets_unique %>%
+      filter(gene_set %in% test_gene_sets) %>%
+      select(gene_set, genes)
+  ) %>%
+  mutate(
+    predictor_var = "lesions_categories_all",
+    task_id = paste("test_models_auto_regresive", gene_set, predictor_var, Cell_Types, sample_type, sep = "_")
+  )
+
+m <- run_model_job(
+  proression_test_tasks_ar$task_id[[1]],
+  proression_test_tasks_ar$input_data_path[[1]],
+  bf(log_scaled ~ lesions_categories_all + (1 | scan_name * target_name)),
+  proression_test_tasks_ar$genes[[1]],
+  save_pars = save_pars(
+    all = TRUE
+  ),
+  family = gaussian(),
+  autocor = cor_ar(formula = ~lesions_categories_all | scan_name:target_name, p = 1)
+)
+
+```
+
+## Test NB model
+
+```{r}
+qc_metrics <- syn("syn60548719") %>%
+  read_csv()
+
+counts_reraw <- count_matrices %>%
+  select(sample_type, TargetName, sample_id, raw_unscaled) %>%
+  inner_join(
+    progression_by_patient_clean %>%
+      filter(sample_type == "cancer", Cell_Types == "epithelial") %>%
+      mutate(count_progression = map(count_progression, \(x) select(x, sample_id, scan_name, lesions_categories_all))) %>%
+      unnest(count_progression) %>%
+      distinct(Cell_Types, sample_id, scan_name, lesions_categories_all),
+    by = "sample_id"
+  ) %>%
+  power_inner_join(
+    qc_metrics %>%
+      select(sample_id, norm_factor = NormalizationFactor),
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(
+    raw_unnorm = as.integer(raw_unscaled / norm_factor)
+  ) %>%
+  group_nest(sample_type, Cell_Types)
+
+example_counts <- counts_reraw$data[[1]] %>%
+  inner_join(
+    gene_sets %>%
+      filter(gene_set == "IRDS"),
+    by = c("TargetName" = "gene")
+  )
+
+test_mod <- brm(
+    raw_unnorm ~ 0 + norm_factor + lesions_categories_all:norm_factor + (0 + lesions_categories_all | scan_name * TargetName),
+    data = example_counts,
+    prior = c(
+      set_prior("cauchy(0, 1)", class = "b")
+      # set_prior("cauchy(0, 1)", class = "Intercept")
+    ),
+    family = negbinomial(),
+    iter = 4000,
+    warmup = 1500,
+    cores = 4,
+    chains = 4,
+    seed = 42,
+    control = list(
+      # Slower sampling to avoid divergences
+      adapt_delta = 0.99
+    ),
+    backend = "rstan"
+  )
+
+
+test_mod_code <- make_stancode(
+    raw_unnorm ~ 0 + norm_factor + lesions_categories_all:norm_factor + (0 + lesions_categories_all | scan_name * TargetName),
+    data = example_counts,
+    prior = c(
+      set_prior("cauchy(0, 1)", class = "b")
+      # set_prior("cauchy(0, 1)", class = "Intercept")
+    ),
+    family = negbinomial()
+  )
+```
+
